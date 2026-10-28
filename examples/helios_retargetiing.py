@@ -131,7 +131,7 @@ def solve_ik(robot: pk.Robot, link_indices, targets, previous_cfg, previous_base
 
 def main(urdf_path: Path = DEFAULT_URDF):
     urdf = load_helios(urdf_path)
-    robot = pk.Robot.from_urdf(urdf)
+    robot = pk.Robot.from_urdf(urdf, default_joint_cfg=urdf.zero_cfg)
     indices = jnp.array([robot.links.names.index(f"ee_{arm}") for arm in HANDS])
     cfg = robot.joint_var_cls.default_factory()
     base = jaxlie.SE3.identity()
