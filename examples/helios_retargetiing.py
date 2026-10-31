@@ -15,10 +15,19 @@ Restart this script after scene resets or changing attachments.
 Output: /joint_command (JointState, radians), including the coupled Rcj2 joints.
 Use --no-command-mimics if Isaac implements that coupling itself. The IK assumes
 the fingers are held at their zero pose in Isaac.
+For RU auto-attachment, enable isaacsim.code_editor.python_server in Isaac once,
+then run with --ros --auto-attach while Isaac is stopped, and press Play.
+This starts helios_attach_isaac.py remotely; no Script Editor step is needed.
+Its optional /helios/ru_attachment status shows the docking target in Viser and
+locks RU in the IK after attachment; startup still needs only /joint_states.
 """
 
 import atexit
+import json
+import os
+import socket
 import time
+import uuid
 from pathlib import Path
 
 import jax.numpy as jnp
@@ -47,6 +56,65 @@ HANDS = {
 D6_OFFSET = (-0.005, 0.018122922877, 0.04950000067)
 
 
+def isaac_request(code, port, timeout=30.0):
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=5.0) as connection:
+            connection.settimeout(timeout)
+            connection.sendall(code.encode())
+            connection.shutdown(socket.SHUT_WR)
+            with connection.makefile("r", encoding="utf-8") as stream:
+                response = json.load(stream)
+    except OSError as error:
+        raise RuntimeError(
+            f"Cannot reach Isaac's Python server on port {port}. Enable "
+            "isaacsim.code_editor.python_server in Isaac's Extensions window. "
+            f"Connection details: {error}"
+        ) from error
+    if response.get("status") != "ok":
+        raise RuntimeError(f"Isaac request failed: {response.get('evalue', response)}")
+    return response
+
+
+def stop_auto_attachment(port, token):
+    # Only stop this process's helper, never a replacement started by another controller.
+    code = (
+        "import builtins\n"
+        "_helper = getattr(builtins, 'helios_attachment', None)\n"
+        f"if _helper is not None and getattr(_helper, 'owner_token', None) == {token!r}:\n"
+        "    _helper.close()\n"
+    )
+    try:
+        isaac_request(code, port, timeout=3.0)
+    except (RuntimeError, ValueError) as error:
+        print(f"Could not send helper shutdown; it will also detect process exit: {error}")
+
+
+def start_auto_attachment(port: int = 8226):
+    """Install the helper in Isaac, tied to this terminal process's lifetime."""
+    source = Path(__file__).with_name("helios_attach_isaac.py").read_text()
+    token = uuid.uuid4().hex
+    # Use a separate namespace so later remote commands cannot overwrite helper globals.
+    code = (
+        "import omni.timeline\n"
+        "if not omni.timeline.get_timeline_interface().is_stopped():\n"
+        "    raise RuntimeError('Stop Isaac before starting auto-attach, then press Play')\n"
+        "if '_helios_attachment_context' not in globals():\n"
+        "    _helios_attachment_context = {}\n"
+        "_previous = _helios_attachment_context.get('helios_attachment')\n"
+        "if _previous is not None:\n"
+        "    _previous.close()\n"
+        "_helios_attachment_context['__name__'] = '_helios_attachment'\n"
+        f"exec(compile({source!r}, 'helios_attach_isaac.py', 'exec'), _helios_attachment_context)\n"
+        f"_helper = _helios_attachment_context['start_attachment'](owner_pid={os.getpid()})\n"
+        f"_helper.owner_token = {token!r}\n"
+        "_helios_attachment_context['helios_attachment'] = _helper\n"
+    )
+    response = isaac_request(code, port)
+    atexit.register(stop_auto_attachment, port, token)
+    print(response.get("output", ""), end="")
+    print("Auto-attach is running in Isaac. Press Play, then move RU toward the target.")
+
+
 class IsaacBridge:
     """ROS stays optional so the standalone Viser example still works."""
 
@@ -54,22 +122,32 @@ class IsaacBridge:
         import rclpy
         from rclpy.qos import qos_profile_sensor_data
         from sensor_msgs.msg import JointState
+        from std_msgs.msg import String
 
         rclpy.init(args=[])
         self.ros, self.message_type, self.names = rclpy, JointState, names
         self.node = rclpy.create_node("helios_ik")
         self.state = None
+        self.attachment = None
         self.publisher = self.node.create_publisher(JointState, joint_command_topic, 1)
         self.node.create_subscription(
             JointState, joint_states_topic,
             lambda msg: setattr(self, "state", (msg, time.monotonic())),
             qos_profile_sensor_data,
         )
+        self.node.create_subscription(String, "/helios/ru_attachment", self.receive_attachment, 1)
         atexit.register(self.close)
+
+    def receive_attachment(self, msg):
+        status = json.loads(msg.data)
+        anchors = np.asarray(status["anchors_m"], dtype=float)
+        if anchors.shape != (4, 3) or not np.isfinite(anchors).all() or type(status["attached"]) is not bool:
+            raise ValueError("Invalid RU attachment status")
+        self.attachment = status
 
     def read(self):
         # Drain queued feedback without blocking the Viser loop.
-        for _ in range(5):
+        for _ in range(6):
             self.ros.spin_once(self.node, timeout_sec=0.0)
         if self.state is None or time.monotonic() - self.state[1] > 1.0:
             return None
@@ -153,7 +231,7 @@ def load_helios(urdf_path: Path, load_meshes: bool = True) -> yourdfpy.URDF:
 
 
 @jdc.jit
-def solve_ik(robot: pk.Robot, link_indices, targets, previous_cfg, previous_base):
+def solve_ik(robot: pk.Robot, link_indices, targets, previous_cfg, previous_base, ru_attached: jdc.Static[bool] = False):
     joint_var = robot.joint_var_cls(0)
     base_var = jaxls.SE3Var(0)
 
@@ -185,7 +263,9 @@ def solve_ik(robot: pk.Robot, link_indices, targets, previous_cfg, previous_base
                     joint_var, base_var, link_indices[:1], targets[:1]
                 ),
                 jaxls.Cost.factory(kind="constraint_eq_zero")(position_residual)(
-                    joint_var, base_var, link_indices[1:], targets[1:]
+                    joint_var, base_var,
+                    link_indices if ru_attached else link_indices[1:],
+                    targets if ru_attached else targets[1:],
                 ),
                 pk.costs.limit_constraint(robot, joint_var),
                 upright_cost(base_var),
@@ -212,7 +292,13 @@ def main(
     joint_states_topic: str = "/joint_states",
     joint_command_topic: str = "/joint_command",
     command_mimics: bool = True,
+    auto_attach: bool = False,
+    isaac_port: int = 8226,
 ):
+    if auto_attach:
+        if not ros:
+            raise ValueError("--auto-attach requires --ros")
+        start_auto_attachment(isaac_port)
     urdf = load_helios(urdf_path)
     robot = pk.Robot.from_urdf(urdf, default_joint_cfg=urdf.zero_cfg)
     indices = jnp.array([robot.links.names.index(f"ee_{arm}") for arm in HANDS])
@@ -253,8 +339,11 @@ def main(
         )
         server.scene.add_label(f"/targets/{arm}/label", text=arm)
     error = server.gui.add_number("Max position error (mm)", 0.0, disabled=True)
+    attachment_status = server.gui.add_text("RU attachment", "No Isaac helper", disabled=True)
+    dock = server.scene.add_icosphere("/ru_dock", radius=0.05, color=(255, 180, 30), opacity=0.25, visible=False)
 
     targets = positions.copy()
+    ru_attached = False
     while True:
         if bridge:
             state = bridge.read()
@@ -263,15 +352,27 @@ def main(
                 continue
             cfg = state
             base = estimate_base(robot.forward_kinematics(cfg)[indices[1:], 4:], targets[1:])
+            if bridge.attachment is not None:
+                status = bridge.attachment
+                anchors = jnp.array(status["anchors_m"])
+                # Align Isaac world coordinates with Viser's initial-root frame.
+                world_to_viser = estimate_base(anchors[1:], targets[1:])
+                dock.position = np.asarray(world_to_viser @ anchors[0])
+                dock.visible = True
+                ru_attached = status["attached"]
+                attachment_status.value = "Attached" if ru_attached else f"Free ({status['distance_m'] * 100:.1f} cm)"
+                controls[0].disable_axes = controls[0].disable_sliders = ru_attached
+                if ru_attached:
+                    controls[0].position = dock.position
         targets[0] = controls[0].position
-        cfg, base = solve_ik(robot, indices, jnp.asarray(targets), cfg, base)
+        cfg, base = solve_ik(robot, indices, jnp.asarray(targets), cfg, base, ru_attached)
         actual = np.asarray(base @ robot.forward_kinematics(cfg)[indices, 4:])
         # Equality constraints are numerical: reject failed/nonfinite solutions.
         if (
             bridge
             and np.isfinite(cfg).all()
             and np.isfinite(actual).all()
-            and np.linalg.norm(actual[1:] - targets[1:], axis=1).max() < 0.001
+            and np.linalg.norm((actual - targets)[0 if ru_attached else 1:], axis=1).max() < 0.001
         ):
             bridge.publish(command_names, robot.joints.get_full_config(cfg)[command_indices])
         with server.atomic():
