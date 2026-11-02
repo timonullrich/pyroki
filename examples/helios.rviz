@@ -1,0 +1,42 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Global Options:
+    Fixed Frame: world
+    Background Color: 40; 40; 40
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 0.25
+      Plane Cell Count: 20
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Commanded robot (blue)
+      Enabled: true
+      Topic:
+        Value: /helios/commanded_robot
+        Depth: 1
+        Reliability Policy: Reliable
+        Durability Policy: Transient Local
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Actual robot (orange)
+      Enabled: true
+      Topic:
+        Value: /helios/actual_robot
+        Depth: 1
+        Reliability Policy: Reliable
+        Durability Policy: Transient Local
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 3.0
+      Focal Point:
+        X: 0.5
+        Y: 0.5
+        Z: 1.0
+      Pitch: 0.3
+      Yaw: 0.8
