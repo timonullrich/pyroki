@@ -7,24 +7,11 @@ No edits are written to the saved robot or scene.
 import builtins
 import json
 import os
-import time
 
 import numpy as np
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
 
-PALMS = ("or2r_R_Carpals", "or2l_L_Carpals", "or4r_R_Carpals", "or4l_L_Carpals")
 ATTACH_DISTANCE = 0.02
-
-
-def find_attachment_joints(stage):
-    joints = [UsdPhysics.Joint(p) for p in stage.Traverse() if p.GetTypeName() == "PhysicsJoint"]
-    result = []
-    for palm in PALMS:
-        matches = [j for j in joints if any(palm in str(p) for p in j.GetBody1Rel().GetTargets())]
-        if len(matches) != 1:
-            raise ValueError(f"Expected one D6 attachment for {palm}, found {len(matches)}")
-        result.append(matches[0])
-    return result
 
 
 def anchor_position(joint, side, transform_point):
@@ -35,7 +22,7 @@ def anchor_position(joint, side, transform_point):
 
 
 class HeliosAttachment:
-    def __init__(self, owner_pid=None, drive_gains=None, effort_names=None, target_m=None):
+    def __init__(self, owner_pid, drive_gains, effort_names, target_m=None):
         import carb
         import omni.kit.app
         import omni.timeline
@@ -46,19 +33,16 @@ class HeliosAttachment:
         from std_msgs.msg import String
 
         self.timeline = omni.timeline.get_timeline_interface()
-        if not self.timeline.is_stopped():
-            raise RuntimeError("Stop Isaac before running this script, then press Play")
         self.stage = omni.usd.get_context().get_stage()
         self.usd_context = omni.usd.get_context()
         self.owner_pid = owner_pid
         self.closed = False
         self.has_played = False
-        self.joints = find_attachment_joints(self.stage)
-        self.ru = self.joints[0]
-        self.effort_names = effort_names or []
+        joints = (UsdPhysics.Joint(p) for p in self.stage.Traverse() if p.GetTypeName() == "PhysicsJoint")
+        self.ru, = [j for j in joints if any("or2r_R_Carpals" in str(p) for p in j.GetBody1Rel().GetTargets())]
+        self.effort_names = effort_names
         self.articulation = None
-        self.wrist_force_index = None
-        paths = {str(p) for j in self.joints for rel in (j.GetBody0Rel(), j.GetBody1Rel()) for p in rel.GetTargets()}
+        paths = {str(p) for rel in (self.ru.GetBody0Rel(), self.ru.GetBody1Rel()) for p in rel.GetTargets()}
         self.ru_forearm_path = str(self.ru.GetBody1Rel().GetTargets()[0].GetParentPath())
         paths.add(self.ru_forearm_path)
         self.prims = {p: XformPrim(p, reset_xform_op_properties=False) for p in paths}
@@ -75,13 +59,9 @@ class HeliosAttachment:
         if not rclpy.ok():
             rclpy.init(args=[])
         self.node = rclpy.create_node("helios_ru_attachment")
-        self.ros = rclpy
         self.message_type = String
         self.publisher = self.node.create_publisher(String, "/helios/ru_attachment", 1)
-        self.node.create_subscription(String, "/helios/ru_attachment_command", self.receive_command, 1)
-        self.armed = False
-        self.command_id = None
-        self.last_update = 0.0
+        self.wait_clear = False
         self.layer = Sdf.Layer.CreateAnonymous("helios_auto_attach")
         self.stage.GetSessionLayer().subLayerPaths.insert(0, self.layer.identifier)
         # A switchable external attachment must not become part of the articulation tree.
@@ -89,30 +69,18 @@ class HeliosAttachment:
             self.ru.CreateExcludeFromArticulationAttr(True)
             if target_m is not None:
                 self.ru.CreateLocalPos0Attr(Gf.Vec3f(*(target_m / self.metres)))
-            if drive_gains is not None:
-                count = 0
-                for prim in self.stage.Traverse():
-                    if prim.IsA(UsdPhysics.RevoluteJoint) or prim.IsA(UsdPhysics.PrismaticJoint):
-                        for drive in UsdPhysics.DriveAPI.GetAll(prim):
-                            drive.CreateStiffnessAttr(drive_gains["stiffness"])
-                            drive.CreateDampingAttr(drive_gains["damping"])
-                            count += 1
-                print(f"Applied motor gains to {count} drives: {drive_gains}")
+            for prim in self.stage.Traverse():
+                if prim.IsA(UsdPhysics.RevoluteJoint) or prim.IsA(UsdPhysics.PrismaticJoint):
+                    for drive in UsdPhysics.DriveAPI.GetAll(prim):
+                        drive.CreateStiffnessAttr(drive_gains["stiffness"])
+                        drive.CreateDampingAttr(drive_gains["damping"])
         self.subscription = omni.kit.app.get_app().get_update_event_stream().create_subscription_to_pop(self.update)
-        print(f"RU attachment ready: {self.ru.GetPath()}; waiting for controller commands")
+        print(f"RU auto-attachment ready: distance < {ATTACH_DISTANCE} m")
 
-    def receive_command(self, msg):
-        command = json.loads(msg.data)
-        command_id = command["id"]
-        if not isinstance(command_id, str) or not command_id:
-            raise ValueError("Attachment command needs a nonempty id")
-        if command["action"] == "release" and command_id != self.command_id:
-            self.armed = False
-            with Usd.EditContext(self.stage, self.layer):
-                self.ru.GetJointEnabledAttr().Set(False)
-            self.command_id = command_id
-        elif command["action"] == "arm" and command_id == self.command_id:
-            self.armed = True
+    def release(self):
+        with Usd.EditContext(self.stage, self.layer):
+            self.ru.GetJointEnabledAttr().Set(False)
+        self.wait_clear = True  # Leave the radius before allowing reattachment.
 
     def transform_point(self, path, local):
         # Fabric supplies the current simulated pose even when USD transforms are stale.
@@ -125,21 +93,12 @@ class HeliosAttachment:
     def read_efforts(self):
         """Initialize after Play; report missing measurements as missing, never zero."""
         try:
-            if not self.effort_names:
-                return {}
             if self.articulation is None:
                 from isaacsim.core.prims import SingleArticulation
-                roots = [p.GetPath() for p in self.stage.Traverse() if p.HasAPI(UsdPhysics.ArticulationRootAPI)]
                 body = self.ru.GetBody1Rel().GetTargets()[0]
-                # Find the nearest enclosing robot subtree with one articulation.
-                matches = []
-                for path in reversed(body.GetPrefixes()):
-                    matches = [root for root in roots if root.HasPrefix(path)]
-                    if matches:
-                        break
-                if len(matches) != 1:
-                    raise ValueError(f"Cannot identify Helios articulation: {matches}")
-                articulation = SingleArticulation(str(matches[0]), reset_xform_properties=False)
+                root = next(p.GetPath() for p in self.stage.Traverse()
+                            if p.HasAPI(UsdPhysics.ArticulationRootAPI) and body.HasPrefix(p.GetPath()))
+                articulation = SingleArticulation(str(root), reset_xform_properties=False)
                 articulation.initialize()
                 self.effort_indices = np.array([articulation.get_dof_index(name) for name in self.effort_names], dtype=int)
                 self.articulation = articulation
@@ -153,21 +112,14 @@ class HeliosAttachment:
         except Exception:
             return {}
 
-    def read_rl_wrist_wrench(self):
-        """Direct transmitted wrench at or4r_right_wrist, not a D6 force estimate."""
+    def read_wrist_wrench(self, joint):
+        """Direct transmitted wrist wrench, not a D6 force estimate."""
         try:
-            if self.articulation is None:
-                return None  # read_efforts initializes the shared articulation after Play.
-            if self.wrist_force_index is None:
-                metadata = self.articulation._articulation_view._metadata
-                # Force rows use articulation JOINT indices + 1 (row 0 is the
-                # base). A DOF index would select the wrong row with fixed joints.
-                self.wrist_force_index = metadata.joint_indices["or4r_right_wrist"] + 1
+            # Force rows use JOINT indices + 1, not DOF indices.
+            index = self.articulation._articulation_view._metadata.joint_indices[joint] + 1
             reading = self.articulation.get_measured_joint_forces(
-                joint_indices=np.array([self.wrist_force_index], dtype=int)
+                joint_indices=np.array([index], dtype=int)
             )
-            if reading is None:
-                raise ValueError("Isaac returned no wrist wrench")
             wrench = np.asarray(reading, dtype=float).reshape(-1)
             if wrench.shape != (6,) or not np.isfinite(wrench).all():
                 raise ValueError("Invalid wrist wrench")
@@ -188,8 +140,6 @@ class HeliosAttachment:
 
     def read_root_pose(self):
         try:
-            if self.articulation is None:
-                return None
             position, orientation = self.articulation.get_world_pose()
             pose = np.concatenate((orientation, np.asarray(position) * self.metres))
             return pose.tolist() if pose.shape == (7,) and np.isfinite(pose).all() else None
@@ -199,45 +149,38 @@ class HeliosAttachment:
     def update(self, _event):
         if self.closed:
             return
-        if self.owner_pid is not None:
-            try:
-                os.kill(self.owner_pid, 0)
-            except ProcessLookupError:
-                self.close()
-                return
-        if self.usd_context.get_stage() != self.stage:
+        try:
+            os.kill(self.owner_pid, 0)
+        except ProcessLookupError:
             self.close()
             return
-        if self.timeline.is_stopped():
-            if self.has_played:
-                self.close()
+        if self.usd_context.get_stage() != self.stage or (self.has_played and self.timeline.is_stopped()):
+            self.close()
             return
         if not self.timeline.is_playing():
             return
         self.has_played = True
-        if time.monotonic() - self.last_update < 0.02:
-            return
-        self.last_update = time.monotonic()
         try:
-            for _ in range(4):
-                self.ros.spin_once(self.node, timeout_sec=0.0)
-            anchors = np.array([anchor_position(j, 0, self.transform_point) for j in self.joints]) * self.metres
+            target = anchor_position(self.ru, 0, self.transform_point) * self.metres
             hand = anchor_position(self.ru, 1, self.transform_point) * self.metres
-            distance = float(np.linalg.norm(hand - anchors[0]))
-            if not np.isfinite(anchors).all() or not np.isfinite(distance):
+            distance = float(np.linalg.norm(hand - target))
+            if not np.isfinite(distance):
                 raise ValueError("Nonfinite attachment positions")
             attached = bool(self.ru.GetJointEnabledAttr().Get())
-            if self.armed and not attached and distance < ATTACH_DISTANCE:
+            if distance >= ATTACH_DISTANCE:
+                self.wait_clear = False
+            if not self.wait_clear and not attached and distance < ATTACH_DISTANCE:
                 with Usd.EditContext(self.stage, self.layer):
                     self.ru.GetJointEnabledAttr().Set(True)
                 attached = True
                 print(f"RU attached at {distance * 100:.2f} cm")
             self.publisher.publish(self.message_type(data=json.dumps({
-                "attached": attached, "distance_m": distance, "anchors_m": anchors.tolist(),
+                "attached": attached, "target_m": target.tolist(),
                 "hand_m": hand.tolist(), "sim_time_s": self.timeline.get_current_time(),
-                "armed": self.armed, "command_id": self.command_id,
                 "efforts_nm": self.read_efforts(),
-                "rl_wrist_wrench": self.read_rl_wrist_wrench(),
+                "rl_wrist_wrench": self.read_wrist_wrench("or4r_right_wrist"),
+                "lu_wrist_wrench": self.read_wrist_wrench("left_wrist"),
+                "ll_wrist_wrench": self.read_wrist_wrench("or4l_left_wrist"),
                 "root_pose_wxyz_xyz": self.read_root_pose(),
                 "ru_roll_rad": self.read_ru_roll(),
             })))
@@ -250,7 +193,6 @@ class HeliosAttachment:
             return
         self.closed = True
         self.subscription.unsubscribe()
-        self.subscription = None
         self.node.destroy_node()
         layers = self.stage.GetSessionLayer().subLayerPaths
         if self.layer.identifier in layers:
@@ -258,7 +200,7 @@ class HeliosAttachment:
         print("RU auto-attach stopped; temporary joint overrides removed")
 
 
-def start_attachment(owner_pid=None, drive_gains=None, effort_names=None, target_m=None):
+def start_attachment(owner_pid, drive_gains, effort_names, target_m=None):
     previous = getattr(builtins, "helios_attachment", None)
     if previous is not None:
         previous.close()

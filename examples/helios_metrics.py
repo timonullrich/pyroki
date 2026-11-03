@@ -45,7 +45,8 @@ class RolloutMetrics:
         self.saved = False
         atexit.register(self.save, "interrupted")
 
-    def add(self, sim_time, hand, target, efforts, solve_ms, steps, costs, accepted, phase, rl_wrist_wrench=None, ru_roll_rad=None):
+    def add(self, sim_time, hand, target, efforts, solve_ms, steps, costs, accepted, phase, rl_wrist_wrench=None, ru_roll_rad=None,
+            lu_wrist_wrench=None, ll_wrist_wrench=None):
         row = {
             "time_s": float(sim_time - self.start_time), "phase": phase,
             "solve_ms": float(solve_ms), "solver_steps": int(steps), "accepted": bool(accepted),
@@ -56,11 +57,12 @@ class RolloutMetrics:
                     for axis, value in zip("xyz", point)})
         row.update({f"effort_nm/{name}": float(efforts.get(name, np.nan)) for name in self.effort_names})
         row.update({f"cost/{name}": float(value) for name, value in costs.items()})
-        wrench = np.full(6, np.nan) if rl_wrist_wrench is None else np.asarray(rl_wrist_wrench, dtype=float)
-        if wrench.shape != (6,):
-            raise ValueError("Expected six lower-right wrist force/torque components")
-        for name, value in zip(("fx_n", "fy_n", "fz_n", "tx_nm", "ty_nm", "tz_nm"), wrench):
-            row[f"rl_wrist/{name}"] = float(value)
+        for arm, wrench in (("rl", rl_wrist_wrench), ("lu", lu_wrist_wrench), ("ll", ll_wrist_wrench)):
+            wrench = np.full(6, np.nan) if wrench is None else np.asarray(wrench, dtype=float)
+            if wrench.shape != (6,):
+                raise ValueError("Expected six wrist force/torque components")
+            for name, value in zip(("fx_n", "fy_n", "fz_n", "tx_nm", "ty_nm", "tz_nm"), wrench):
+                row[f"{arm}_wrist/{name}"] = float(value)
         self.rows.append(row)
 
     def save(self, outcome="completed"):
@@ -139,18 +141,20 @@ class RolloutMetrics:
                     label = name.replace("_violation", " (violation²)").replace("_", " ")
                     axes[2].plot(t, column(key), label=label, linestyle="--" if hard else "-", linewidth=1)
         axes[2].set_yscale("symlog", linthresh=1e-8)
-        for axis, values, prefix in ((axes[3], wrist_force, "F"), (axes[4], wrist_torque, "T")):
-            for i, component in enumerate("xyz"):
-                axis.plot(t, values[:, i], label=f"{prefix}{component}")
-            axis.plot(t, np.linalg.norm(values, axis=1), label="Magnitude", color="black", linestyle="--")
+        for hand, style in (("rl", "-"), ("lu", "--"), ("ll", ":")):
+            for axis, prefix, unit in ((axes[3], "f", "n"), (axes[4], "t", "nm")):
+                values = np.column_stack([column(f"{hand}_wrist/{prefix}{c}_{unit}") for c in "xyz"])
+                for i, component in enumerate("xyz"):
+                    axis.plot(t, values[:, i], label=f"{hand.upper()} {prefix.upper()}{component}", color=f"C{i}", linestyle=style)
+                axis.plot(t, np.linalg.norm(values, axis=1), label=f"{hand.upper()} magnitude", color="black", linestyle=style)
         axes[5].plot(t, np.degrees(column("ru_roll_rad")), label="Measured forearm tilt")
         axes[5].axhline(0, color="gray", linestyle="--", label="Target (0°)")
         labels = (
             ("Measured RU tracking error", "Error (mm)"),
             ("Measured actuator efforts (fingers excluded)", "Effort (N·m)"),
             ("IK objective before/after solve and final terms", "Cost / violation²"),
-            ("Lower-right wrist force (child joint frame)", "Force (N)"),
-            ("Lower-right wrist torque (child joint frame)", "Torque (N·m)"),
+            ("Attached wrist forces (each child joint frame)", "Force (N)"),
+            ("Attached wrist torques (each child joint frame)", "Torque (N·m)"),
             ("Measured RU forearm tilt in global Y-Z", "Tilt (°)"),
         )
         axes[-1].set_xlabel("Simulation time since trigger (s)")

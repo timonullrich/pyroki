@@ -13,7 +13,8 @@ python examples/helios_retargetiing.py
 
 Start the controller with Isaac **stopped**, then press Play. LU/RL/LL must
 be attached and the fingers held at zero. Space releases RU, retreats along
-world +Y, travels with clearance, approaches along -Y, and reattaches.
+world +Y, travels with clearance, approaches along -Y, and automatically
+reattaches within 2 cm. A released hand must first leave that radius.
 Press q or Ctrl+C to exit. Restart after resetting the scene.
 
 Configuration:
@@ -24,7 +25,7 @@ Configuration:
 
 Target, gain and attachment overrides are temporary. Stop Isaac or exit the
 controller to remove them before editing the underlying scene target.
-Joint feedback initializes IK once; subsequent solves use the previous solution.
+Joint feedback and Isaac's root pose initialize IK once; subsequent solves use the previous solution.
 Attached positions are hard constraints and orientations have soft penalties.
 
 Run RViz in another sourced terminal:
