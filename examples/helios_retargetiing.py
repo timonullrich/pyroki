@@ -13,7 +13,7 @@ using D6_OFFSET. IK coordinates are relative to the initial root. Joint feedback
 initializes IK once; subsequent solves use the previous solution.
 Attached-hand positions are hard constraints; their orientations have a strong
 soft penalty. LU/RL/LL retain startup orientations; RU retains its orientation
-at attachment. RU's hand pointing direction has a soft horizontal preference
+at attachment. RU's forearm direction has a soft horizontal preference
 in the global Y-Z plane.
 Restart this script after scene resets or changing attachments.
 Output: /joint_command (JointState, radians), including the coupled Rcj2 joints.
@@ -74,13 +74,13 @@ HANDS = {
 D6_OFFSET = (-0.005, 0.018122922877, 0.04950000067)
 # RU body0-local target in metres (world coordinates when body0 is empty).
 # Edit between runs; None uses the scene target. Applied with --auto-attach.
-RU_TARGET_M = (0.28, 0.265, 1.208)
+RU_TARGET_M = (0.28, 0.265, 1.408)
 # Residual multipliers: each soft cost is sum((weight * error)**2).
 COST_WEIGHTS = {
     "position": 50.0,  # Also scales the hard attached-position constraints.
     "fixed_orientations": 25.0,
-    "ru_roll": 0.0,  # Hand pointing tilt in the global Y-Z plane; 0 disables it.
-    "upright": 5.0,
+    "ru_roll": 0.0,  # Forearm tilt in the global Y-Z plane; 0 disables it.
+    "upright": 0.0,
     "motion": 0.05,
 }
 
@@ -337,11 +337,12 @@ def solve_ik(
 
     @jaxls.Cost.factory
     def ru_roll_cost(vals, var, base):
-        rotation = vals[base].rotation() @ jaxlie.SO3(robot.forward_kinematics(vals[var])[link_indices[0], :4])
+        forearm = robot.links.names.index("or2r_TopTower_Model_4a80d30e")  # Parent of the RU wrist joint.
+        rotation = vals[base].rotation() @ jaxlie.SO3(robot.forward_kinematics(vals[var])[forearm, :4])
         if ik_to_world is not None:
             rotation = ik_to_world @ rotation
         matrix = rotation.as_matrix()
-        # Fingers point along local +Z: column 2 is their world direction.
+        # This frame's +Z points along the forearm towards the wrist, before wrist rotation.
         # Both +/-Y are horizontal. Epsilon handles a vanishing Y-Z projection.
         return jnp.atleast_1d(COST_WEIGHTS["ru_roll"] * jnp.arctan2(matrix[2, 2], jnp.abs(matrix[1, 2]) + 1e-8))
 

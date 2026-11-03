@@ -98,7 +98,7 @@ class RolloutMetrics:
                 "computation": "Synchronized IK call including returned diagnostics; excludes JIT warmup, logging and plots.",
                 "steps": "jaxls SolveSummary.iterations per IK call, including rejected solves.",
                 "tracking": "Measured RU attachment-point position versus the previously published target at feedback sampling time.",
-                "ru_roll": "RU hand local +Z pointing direction projected into global Y-Z: atan2(direction_z, abs(direction_y)), 0 = horizontal along either +/-Y. CSV in radians, plot in degrees. Missing samples are NaN.",
+                "ru_roll": "RU forearm direction (wrist parent frame +Z) projected into global Y-Z: atan2(direction_z, abs(direction_y)), 0 = horizontal along either +/-Y. Independent of wrist rotation. CSV in radians, plot in degrees. Missing samples are NaN.",
                 "efforts": "Isaac get_measured_joint_efforts(), N m; missing samples are NaN, not zero.",
                 "rl_wrist": "Direct get_measured_joint_forces() at or4r_right_wrist: Fx/Fy/Fz in N and Tx/Ty/Tz in N m, expressed in the child joint frame. Missing readings are NaN. This is the transmitted wrist-joint wrench, not the external D6 attachment wrench.",
                 "costs": "The IK objective IS the sum of squared weighted soft residuals. total_objective is evaluated at the optimizer's returned solution; initial_objective is JAXLS's recorded value before solving. Hard-constraint curves show squared violations separately. These are model-space values, not measured Isaac tracking costs, and exclude internal augmented-Lagrangian penalties.",
@@ -161,9 +161,9 @@ class RolloutMetrics:
             if not wrist_valid.all():
                 axis.text(0.01, 0.98, "Missing wrist samples: see summary.json", transform=axis.transAxes, va="top")
         axes[2].set_xlabel("")
-        axes[5].plot(t, np.degrees(column("ru_roll_rad")), label="Measured hand tilt")
+        axes[5].plot(t, np.degrees(column("ru_roll_rad")), label="Measured forearm tilt")
         axes[5].axhline(0, color="gray", linestyle="--", label="Target (0°)")
-        axes[5].set(title="Measured RU hand pointing tilt in global Y-Z plane", ylabel="Tilt (°)", xlabel="Simulation time since trigger (s)")
+        axes[5].set(title="Measured RU forearm tilt in global Y-Z plane", ylabel="Tilt (°)", xlabel="Simulation time since trigger (s)")
         axes[5].legend(loc="upper left", bbox_to_anchor=(1, 1))
         for axis in axes:
             for line in axis.lines:

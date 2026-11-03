@@ -24,19 +24,25 @@ class OrientationTests(unittest.TestCase):
         cls.weights["ru_roll"] = 1.0  # Exercise the penalty even if disabled in the user's settings.
         # Three noncollinear support points fix the base. The RU slider can move,
         # but no joint can rotate a hand: conflicting orientations are infeasible.
+        # A bent wrist makes the hand's pointing direction differ from the forearm.
+        hand_origin = np.eye(4)
+        hand_origin[:3, :3] = np.asarray(jaxlie.SO3.from_x_radians(0.7).as_matrix())
         joints = [yourdfpy.Joint(
             name="slider", type="prismatic", parent="root", child="RU", axis=np.array([1., 0, 0]),
-            origin=np.eye(4), limit=yourdfpy.Limit(lower=-1, upper=1, effort=1, velocity=1),
+            origin=hand_origin, limit=yourdfpy.Limit(lower=-1, upper=1, effort=1, velocity=1),
         )]
+        forearm = "or2r_TopTower_Model_4a80d30e"
+        joints.append(yourdfpy.Joint(name="forearm", type="fixed", parent="root", child=forearm, origin=np.eye(4)))
         for name, position in zip(("LU", "RL", "LL"), np.eye(3)):
             origin = np.eye(4)
             origin[:3, 3] = position
             joints.append(yourdfpy.Joint(name=name, type="fixed", parent="root", child=name, origin=origin))
         urdf = yourdfpy.URDF(yourdfpy.Robot(
-            name="orientation_test", links=[yourdfpy.Link(name=n) for n in ("root", "RU", "LU", "RL", "LL")],
+            name="orientation_test", links=[yourdfpy.Link(name=n) for n in ("root", "RU", "LU", "RL", "LL", forearm)],
             joints=joints,
         ), load_meshes=False)
         cls.robot = pk.Robot.from_urdf(urdf)
+        cls.forearm_index = cls.robot.links.names.index(forearm)
         cls.indices = jnp.array([cls.robot.links.names.index(n) for n in ("RU", "LU", "RL", "LL")])
         cls.cfg = cls.robot.joint_var_cls.default_factory()
         cls.base = jaxlie.SE3.identity()
@@ -81,21 +87,22 @@ class OrientationTests(unittest.TestCase):
         rotation_error = (jaxlie.SO3(self.rotations[1:]).inverse() @ (base.rotation() @ jaxlie.SO3(poses[1:, :4]))).log()
         upright_error = base.rotation().as_matrix()[:, 2] - jnp.array([0, 0, 1])
         motion = jnp.concatenate([cfg - self.cfg, (self.base.inverse() @ base).log()])
-        ru_matrix = (base.rotation() @ jaxlie.SO3(poses[0, :4])).as_matrix()
+        forearm_rotation = jaxlie.SO3(self.robot.forward_kinematics(cfg)[self.forearm_index, :4])
+        ru_matrix = (base.rotation() @ forearm_rotation).as_matrix()
         roll = jnp.arctan2(ru_matrix[2, 2], jnp.abs(ru_matrix[1, 2]) + 1e-8)
         objective = (jnp.sum((self.weights["position"] * ru_error)**2) + jnp.sum((25 * rotation_error)**2)
                      + (self.weights["ru_roll"] * roll)**2 + jnp.sum((self.weights["upright"] * upright_error)**2)
                      + jnp.sum((self.weights["motion"] * motion)**2))
         np.testing.assert_allclose(costs["total_objective"], objective, rtol=1e-5)
-        # Initially the hand points straight up, in addition to the 20 cm displacement.
+        # Initially the forearm points up even though the wrist/hand is bent.
         expected_initial = (self.weights["position"] * 0.2)**2 + (self.weights["ru_roll"] * np.pi / 2)**2
         self.assertAlmostEqual(float(costs["initial_objective"]), expected_initial, places=4)
         self.assertLess(float(costs["total_objective"]), float(costs["initial_objective"]))
 
     def test_ru_roll_uses_world_frame_and_stays_soft(self):
         for roll, direction in ((0.0, 1), (0.4, 1), (-0.4, 1), (0.0, -1)):
-            # Local +Z points along +/-world Y, tilted upwards/downwards. Twisting
-            # about local Z must not change the pointing-direction penalty.
+            # Forearm +Z points along +/-world Y, tilted upwards/downwards.
+            # The bent hand must not affect the forearm's tilt penalty.
             ik_to_world = (jaxlie.SO3.from_x_radians(direction * (-np.pi / 2 + roll))
                            @ jaxlie.SO3.from_z_radians(0.6))
             cfg, base, _, costs = self.solve(self.robot, self.indices, self.targets, self.rotations,

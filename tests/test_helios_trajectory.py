@@ -189,21 +189,22 @@ class AttachmentTests(unittest.TestCase):
         helper.articulation.get_measured_joint_forces.return_value = None
         self.assertIsNone(self.update()["rl_wrist_wrench"])
 
-    def test_ru_roll_comes_from_measured_world_orientation(self):
+    def test_ru_tilt_comes_from_forearm_not_hand(self):
         import jaxlie
 
         helper = self.helper
-        helper.ru.GetBody1Rel.return_value.GetTargets.return_value = ["/palm"]
+        helper.ru_forearm_path = "/forearm"
         helper.use_backend = lambda *_args, **_kwargs: contextlib.nullcontext()
         helper.backend = "fabric"
         rotation = (jaxlie.SO3.from_x_radians(-np.pi / 2 + 0.4)
                     @ jaxlie.SO3.from_z_radians(-0.7))
         orientation = Mock()
         orientation.numpy.return_value = np.asarray(rotation.wxyz)[None]
-        palm = Mock()
-        palm.get_world_poses.return_value = (None, orientation)
-        helper.prims = {"/palm": palm}
+        forearm, palm = Mock(), Mock()
+        forearm.get_world_poses.return_value = (None, orientation)
+        helper.prims = {"/forearm": forearm, "/palm": palm}
         self.assertAlmostEqual(self.update()["ru_roll_rad"], 0.4, places=6)
+        palm.get_world_poses.assert_not_called()
         orientation.numpy.return_value = np.full((1, 4), np.nan)
         self.assertIsNone(self.update()["ru_roll_rad"])
 

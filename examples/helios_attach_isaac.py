@@ -19,7 +19,7 @@ sim_time_s, armed, command_id, and efforts_nm from get_measured_joint_efforts().
 rl_wrist_wrench contains [Fx, Fy, Fz, Tx, Ty, Tz] from the lower-right wrist's
 get_measured_joint_forces() reading, in its child joint frame (N and N m).
 root_pose_wxyz_xyz is the measured articulation root pose in world metres.
-ru_roll_rad is the RU hand pointing tilt in the global Y-Z plane (0 = horizontal).
+ru_roll_rad is the RU forearm tilt in the global Y-Z plane (0 = horizontal).
 The launcher supplies the non-finger motor names to measure. Receives commands on
 /helios/ru_attachment_command; release must be acknowledged before motion.
 The IK subscribes automatically; no additional OmniGraph nodes are needed.
@@ -84,6 +84,8 @@ class HeliosAttachment:
         self.wrist_force_index = None
         self.wrist_warning = False
         paths = {str(p) for j in self.joints for rel in (j.GetBody0Rel(), j.GetBody1Rel()) for p in rel.GetTargets()}
+        self.ru_forearm_path = str(self.ru.GetBody1Rel().GetTargets()[0].GetParentPath())
+        paths.add(self.ru_forearm_path)
         self.prims = {p: XformPrim(p, reset_xform_op_properties=False) for p in paths}
         self.use_backend = use_backend
         settings = carb.settings.get_settings()
@@ -212,11 +214,10 @@ class HeliosAttachment:
 
     def read_ru_roll(self):
         try:
-            palm = str(self.ru.GetBody1Rel().GetTargets()[0])
             with self.use_backend(self.backend, raise_on_fallback=True):
-                _, orientation = self.prims[palm].get_world_poses()
+                _, orientation = self.prims[self.ru_forearm_path].get_world_poses()
             w, x, y, z = orientation.numpy()[0]
-            # World Y/Z components of the hand's local +Z (finger) direction.
+            # World Y/Z components of the forearm's +Z direction, before wrist rotation.
             roll = np.arctan2(1 - 2 * (x * x + y * y), abs(2 * (y * z - w * x)) + 1e-8)
             return float(roll) if np.isfinite(roll) else None
         except Exception:
