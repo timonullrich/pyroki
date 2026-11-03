@@ -21,6 +21,7 @@ class OrientationTests(unittest.TestCase):
             module = runpy.run_path(str(examples / "helios_retargetiing.py"))
         cls.solve = staticmethod(module["solve_ik"])
         cls.weights = module["COST_WEIGHTS"]
+        cls.weights["fixed_orientations"] = 25.0
         cls.weights["ru_roll"] = 1.0  # Exercise the penalty even if disabled in the user's settings.
         # Three noncollinear support points fix the base. The RU slider can move,
         # but no joint can rotate a hand: conflicting orientations are infeasible.
@@ -57,7 +58,7 @@ class OrientationTests(unittest.TestCase):
                 # Once RU is attached the seed is already at its docking position.
                 seed = self.cfg.at[0].set(0.2) if attached else self.cfg
                 cfg, base, steps, costs = self.solve(self.robot, self.indices, self.targets, rotations,
-                                                    seed, self.base, attached, 25.0)
+                                                    seed, self.base, attached)
                 self.assertGreater(int(steps), 0)
                 self.assertTrue(all(np.isfinite(value) and value >= 0 for value in costs.values()))
                 expected_total = sum(costs[name] for name in ("ru_position", "fixed_orientations", "ru_roll", "upright", "motion"))
@@ -75,13 +76,13 @@ class OrientationTests(unittest.TestCase):
     def test_free_ru_orientation_has_no_penalty(self):
         changed = self.rotations.at[0].set(jaxlie.SO3.from_z_radians(1.0).wxyz)
         solutions = [self.solve(self.robot, self.indices, self.targets, rotations,
-                               self.cfg, self.base, False, 25.0) for rotations in (self.rotations, changed)]
+                               self.cfg, self.base, False) for rotations in (self.rotations, changed)]
         np.testing.assert_allclose(solutions[0][0], solutions[1][0], atol=1e-6)
         np.testing.assert_allclose(solutions[0][1].wxyz_xyz, solutions[1][1].wxyz_xyz, atol=1e-6)
 
     def test_objective_matches_explicit_ik_formula(self):
         cfg, base, _, costs = self.solve(self.robot, self.indices, self.targets, self.rotations,
-                                         self.cfg, self.base, False, 25.0)
+                                         self.cfg, self.base, False)
         poses = self.robot.forward_kinematics(cfg)[self.indices]
         ru_error = base @ poses[0, 4:] - self.targets[0]
         rotation_error = (jaxlie.SO3(self.rotations[1:]).inverse() @ (base.rotation() @ jaxlie.SO3(poses[1:, :4]))).log()
@@ -106,7 +107,7 @@ class OrientationTests(unittest.TestCase):
             ik_to_world = (jaxlie.SO3.from_x_radians(direction * (-np.pi / 2 + roll))
                            @ jaxlie.SO3.from_z_radians(0.6))
             cfg, base, _, costs = self.solve(self.robot, self.indices, self.targets, self.rotations,
-                                             self.cfg, self.base, False, 25.0, ik_to_world)
+                                             self.cfg, self.base, False, ik_to_world)
             self.assertAlmostEqual(float(costs["initial_objective"]),
                                    (self.weights["position"] * 0.2)**2 + (self.weights["ru_roll"] * roll)**2, places=3)
             positions = base @ self.robot.forward_kinematics(cfg)[self.indices, 4:]

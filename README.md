@@ -1,79 +1,47 @@
-# `PyRoki`: Python Robot Kinematics Library
+# Helios IK
 
-**[Project page](https://pyroki-toolkit.github.io/) &bull;
-[arXiv](https://arxiv.org/abs/2505.03728)**
+ROS 2 controller using the included Pyroki library. Requires Python 3.12,
+ROS Jazzy and Isaac Sim with its ROS 2 Bridge and
+`isaacsim.code_editor.python_server` enabled.
 
-`PyRoki` is a modular, extensible, and cross-platform toolkit for kinematic optimization, all in Python.
-
-Core features include:
-
-- Differentiable robot forward kinematics model from a URDF.
-- Automatic generation of robot collision primitives (e.g., capsules).
-- Differentiable collision bodies with numpy broadcasting logic.
-- Common cost implementations (e.g., end effector pose, self/world-collision, manipulability).
-- Arbitrary costs, autodiff or analytical Jacobians.
-- Integration with a [Levenberg-Marquardt Solver](https://github.com/brentyi/jaxls) that supports optimization on manifolds (e.g., [lie groups](https://github.com/brentyi/jaxlie)) and hard constraints via an Augmented Lagrangian solver.
-- Cross-platform support (CPU, GPU, TPU) via JAX.
-
-Please refer to the [documentation](https://chungmin99.github.io/pyroki/) for more details, features, and usage examples.
-
----
-
-## Installation
-
-You can install `pyroki` with `pip`, on Python 3.10+:
-
-```
-git clone https://github.com/chungmin99/pyroki.git
-cd pyroki
-pip install -e .
+```bash
+source /opt/ros/jazzy/setup.bash
+source .venv/bin/activate
+python -m pip install -e '.[helios]'
+python examples/helios_retargetiing.py
 ```
 
-## Status
+Start the controller with Isaac **stopped**, then press Play. LU/RL/LL must
+be attached and the fingers held at zero. Space releases RU, retreats along
+world +Y, travels with clearance, approaches along -Y, and reattaches.
+Press q or Ctrl+C to exit. Restart after resetting the scene.
 
-_May 6, 2025_: Initial release
+Configuration:
 
-We are preparing and will release by _May 16, 2025_:
+- `examples/helios_retargetiing.py`: `RU_TARGET_M`, `D6_OFFSET`, `COST_WEIGHTS`.
+  `ru_roll` penalizes RU forearm tilt in global Y-Z; 0 means horizontal.
+- `examples/helios.yaml`: motor gains, clearance, durations and tracking tolerances.
 
-- [x] Examples + documentation for hand / humanoid motion retargeting
-- [x] Documentation for using manually defined Jacobians
-- [x] Support with Python 3.10+
+Target, gain and attachment overrides are temporary. Stop Isaac or exit the
+controller to remove them before editing the underlying scene target.
+Joint feedback initializes IK once; subsequent solves use the previous solution.
+Attached positions are hard constraints and orientations have soft penalties.
 
-## Limitations
+Run RViz in another sourced terminal:
 
-- **Static shapes & JIT overhead**: JAX JIT compilation is triggered on first run and when input shapes change (e.g., number of targets, obstacles). Arrays can be pre-padded to vectorize over inputs with different shapes.
-- **No sampling-based planners**: We don't include sampling-based planners (e.g., graphs, trees).
-- **Collision performance**: Speed and accuracy comparisons against other robot toolkits such as CuRobo have not been extensively performed, and is likely slower than other toolkits for collision-heavy scenarios.
-
-The following are current implementation limitations that could potentially be addressed in future versions:
-
-- **Joint types**: We only support revolute, continuous, prismatic, and fixed joints. Other URDF joint types are treated as fixed joints.
-- **Collision geometry**: We are limited to sphere, capsule, halfspace, and heightmap geometries. Mesh collision is approximated as capsules.
-- **Kinematic structures**: We only support kinematic trees; no closed-loop mechanisms or parallel manipulators.
-
-## Citation
-
-This codebase is released with the following preprint.
-
-<table><tr><td>
-    Chung Min Kim*, Brent Yi*, Hongsuk Choi, Yi Ma, Ken Goldberg, Angjoo Kanazawa.
-    <strong>PyRoki: A Modular Toolkit for Robot Kinematic Optimization</strong>
-    arXiV, 2025.
-</td></tr>
-</table>
-
-<sup>\*</sup><em>Equal Contribution</em>, <em>UC Berkeley</em>.
-
-Please cite PyRoki if you find this work useful for your research:
-
-```
-@inproceedings{kim2025pyroki,
-  title={PyRoki: A Modular Toolkit for Robot Kinematic Optimization},
-  author={Kim*, Chung Min and Yi*, Brent and Choi, Hongsuk and Ma, Yi and Goldberg, Ken and Kanazawa, Angjoo},
-  booktitle={2025 IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)},
-  year={2025},
-  url={https://arxiv.org/abs/2505.03728},
-}
+```bash
+rviz2 -d examples/helios.rviz
 ```
 
-Thanks!
+Blue is commanded; orange is measured. Use Move Camera to orbit/pan/zoom.
+`--no-rviz` disables publishing. `--help` lists the remaining path/port options.
+The ROS topics are `/joint_states` and `/joint_command`; coupled joints are commanded.
+
+Each transfer saves `summary.json`, `rollout.csv` and `metrics.png` under
+`helios_runs/` (`--metrics-dir` overrides this). CSV uses semicolons; exported
+floats use four significant figures. Only plots are smoothed. Missing sensor
+readings are NaN. Costs before/after solving are the model's soft objective;
+hard-constraint violations are shown separately.
+
+Offline checks: `.venv/bin/python -m unittest discover -s tests -p 'test_helios_*.py'`.
+The Pyroki library and its original license are retained; see `LICENSE`.

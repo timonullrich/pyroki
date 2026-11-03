@@ -1,37 +1,8 @@
-"""Headless Helios IK: press Space to transfer RU to its scene attachment target.
+"""Helios ROS IK. Start with Isaac stopped, then Play; Space transfers RU, q exits.
 
-Run from a terminal: python examples/helios_retargetiing.py
-Uses the neighbouring Thesis checkout's URDF/meshes; override with --urdf-path.
-
-Isaac: source /opt/ros/jazzy/setup.bash and source .venv/bin/activate before running.
-The project .venv must use Python 3.12 for ROS Jazzy.
-Install dependencies: python -m pip install -e . PyYAML matplotlib
-This is a standalone ROS node; no colcon build or workspace overlay is needed.
-Input: /joint_states (JointState). Start after LU, RL, LL are attached and settled.
-Their startup FK positions are latched in the initial root frame (assumed upright),
-using D6_OFFSET. IK coordinates are relative to the initial root. Joint feedback
-initializes IK once; subsequent solves use the previous solution.
-Attached-hand positions are hard constraints; their orientations have a strong
-soft penalty. LU/RL/LL retain startup orientations; RU retains its orientation
-at attachment. RU's forearm direction has a soft horizontal preference
-in the global Y-Z plane.
-Restart this script after scene resets or changing attachments.
-Output: /joint_command (JointState, radians), including the coupled Rcj2 joints.
-Use --no-command-mimics if Isaac implements that coupling itself. The IK assumes
-the fingers are held at their zero pose in Isaac.
-For RU auto-attachment, enable isaacsim.code_editor.python_server in Isaac once,
-then run while Isaac is stopped, and press Play (--ros --auto-attach are defaults).
-This starts helios_attach_isaac.py remotely; no Script Editor step is needed.
-It also applies helios_gains.yaml to all existing motor drives until shutdown.
-Space releases RU, retreats along world +Y, travels with clearance, approaches
-along -Y, then arms attachment. Edit helios_trajectory.yaml for clearance/timing.
-RU_TARGET_M temporarily overrides RU's body0 anchor through the helper's session
-layer. Stop Isaac or exit this script to remove it before editing the scene target.
-Hand feedback gates trajectory progress, but does not reseed IK.
-RViz overlay: rviz2 -d examples/helios.rviz (blue: commanded, orange: measured).
-Use --no-rviz to disable its publishers; no extra ROS nodes are needed.
-Press q or Ctrl+C to exit. Use --no-auto-attach if the helper is already running.
-Each transfer saves summary.json, rollout.csv, and metrics.png under helios_runs/.
+Joint feedback initializes IK once; measured hand motion gates the clearance path.
+Attachments, gains and target overrides use a removable Isaac session layer.
+Run instructions and configuration: README.md.
 """
 
 import atexit
@@ -55,8 +26,8 @@ import numpy as np
 import pyroki as pk
 import tyro
 import yourdfpy
+import yaml
 
-from helios_trajectory import ClearanceTrajectory
 from helios_metrics import RolloutMetrics
 
 DEFAULT_URDF = (
@@ -86,66 +57,42 @@ COST_WEIGHTS = {
 
 
 def isaac_request(code, port, timeout=30.0):
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=5.0) as connection:
-            connection.settimeout(timeout)
-            connection.sendall(code.encode())
-            connection.shutdown(socket.SHUT_WR)
-            with connection.makefile("r", encoding="utf-8") as stream:
-                response = json.load(stream)
-    except OSError as error:
-        raise RuntimeError(
-            f"Cannot reach Isaac's Python server on port {port}. Enable "
-            "isaacsim.code_editor.python_server in Isaac's Extensions window. "
-            f"Connection details: {error}"
-        ) from error
+    with socket.create_connection(("127.0.0.1", port), timeout=5.0) as connection:
+        connection.settimeout(timeout)
+        connection.sendall(code.encode())
+        connection.shutdown(socket.SHUT_WR)
+        with connection.makefile("r", encoding="utf-8") as stream:
+            response = json.load(stream)
     if response.get("status") != "ok":
         raise RuntimeError(f"Isaac request failed: {response.get('evalue', response)}")
     return response
 
 
-def stop_auto_attachment(port, token):
-    # Only stop this process's helper, never a replacement started by another controller.
+def stop_auto_attachment(port):
     code = (
         "import builtins\n"
         "_helper = getattr(builtins, 'helios_attachment', None)\n"
-        f"if _helper is not None and getattr(_helper, 'owner_token', None) == {token!r}:\n"
+        f"if _helper is not None and _helper.owner_pid == {os.getpid()}:\n"
         "    _helper.close()\n"
     )
     try:
         isaac_request(code, port, timeout=3.0)
-    except (RuntimeError, ValueError) as error:
+    except (OSError, RuntimeError, ValueError) as error:
         print(f"Could not send helper shutdown; it will also detect process exit: {error}")
 
 
-def start_auto_attachment(port: int = 8226, effort_names=None):
-    """Install the helper in Isaac, tied to this terminal process's lifetime."""
-    import yaml
-
+def start_auto_attachment(port, effort_names, gains):
     source = Path(__file__).with_name("helios_attach_isaac.py").read_text()
-    gains = yaml.safe_load(Path(__file__).with_name("helios_gains.yaml").read_text())
-    gains = {name: float(gains[name]) for name in ("stiffness", "damping")}
-    if not all(np.isfinite(value) and value >= 0 for value in gains.values()):
-        raise ValueError("Motor gains must be finite and nonnegative")
-    token = uuid.uuid4().hex
-    # Use a separate namespace so later remote commands cannot overwrite helper globals.
     code = (
         "import omni.timeline\n"
         "if not omni.timeline.get_timeline_interface().is_stopped():\n"
         "    raise RuntimeError('Stop Isaac before starting auto-attach, then press Play')\n"
-        "if '_helios_attachment_context' not in globals():\n"
-        "    _helios_attachment_context = {}\n"
-        "_previous = _helios_attachment_context.get('helios_attachment')\n"
-        "if _previous is not None:\n"
-        "    _previous.close()\n"
-        "_helios_attachment_context['__name__'] = '_helios_attachment'\n"
-        f"exec(compile({source!r}, 'helios_attach_isaac.py', 'exec'), _helios_attachment_context)\n"
-        f"_helper = _helios_attachment_context['start_attachment'](owner_pid={os.getpid()}, drive_gains={gains!r}, effort_names={effort_names!r}, target_m={RU_TARGET_M!r})\n"
-        f"_helper.owner_token = {token!r}\n"
-        "_helios_attachment_context['helios_attachment'] = _helper\n"
+        "_helios = {'__name__': '_helios_attachment'}\n"
+        f"exec(compile({source!r}, 'helios_attach_isaac.py', 'exec'), _helios)\n"
+        f"_helios['start_attachment']({os.getpid()}, {gains!r}, {effort_names!r}, {RU_TARGET_M!r})\n"
     )
     response = isaac_request(code, port)
-    atexit.register(stop_auto_attachment, port, token)
+    atexit.register(stop_auto_attachment, port)
     print(response.get("output", ""), end="")
     print("Attachment helper is running in Isaac. Press Play, then wait for the Space-key prompt.")
 
@@ -165,7 +112,6 @@ class IsaacBridge:
         self.state = None
         self.attachment = None
         self.attachment_received = 0.0
-        self.closed = False
         self.string_type = String
         self.publisher = self.node.create_publisher(JointState, joint_command_topic, 1)
         self.attachment_publisher = self.node.create_publisher(String, "/helios/ru_attachment_command", 1)
@@ -175,20 +121,9 @@ class IsaacBridge:
             qos_profile_sensor_data,
         )
         self.node.create_subscription(String, "/helios/ru_attachment", self.receive_attachment, 1)
-        atexit.register(self.close)
 
     def receive_attachment(self, msg):
-        status = json.loads(msg.data)
-        anchors = np.asarray(status["anchors_m"], dtype=float)
-        hand = np.asarray(status["hand_m"], dtype=float)
-        if (
-            anchors.shape != (4, 3) or not np.isfinite(anchors).all()
-            or hand.shape != (3,) or not np.isfinite(hand).all()
-            or type(status["attached"]) is not bool or type(status["armed"]) is not bool
-            or not np.isfinite(status["sim_time_s"]) or not np.isfinite(status["distance_m"])
-        ):
-            raise ValueError("Invalid RU attachment status")
-        self.attachment = status
+        self.attachment = json.loads(msg.data)
         self.attachment_received = time.monotonic()
 
     def attachment_status(self):
@@ -225,9 +160,6 @@ class IsaacBridge:
         return True
 
     def close(self):
-        if self.closed:
-            return
-        self.closed = True
         self.node.destroy_node()
         self.ros.try_shutdown()
 
@@ -252,6 +184,49 @@ class TerminalKeys:
         termios.tcsetattr(self.fd, termios.TCSADRAIN, self.settings)
 
 
+class ClearanceTrajectory:
+    phases = ("retreat (+Y)", "travel", "approach (-Y)")
+
+    def __init__(self, start, goal, offset, durations_s, waypoint_tolerance_m, tracking_tolerance_m):
+        start, goal, offset = np.asarray([start, goal, offset], dtype=float)
+        self.waypoints = np.array([start, start + offset, goal + offset, goal])
+        self.durations = np.asarray(durations_s, dtype=float)
+        self.waypoint_tolerance = float(waypoint_tolerance_m)
+        self.tracking_tolerance = float(tracking_tolerance_m)
+        if self.waypoints.shape != (4, 3) or not np.isfinite(self.waypoints).all():
+            raise ValueError("Trajectory points must be finite 3D positions")
+        if self.durations.shape != (3,) or not np.isfinite(self.durations).all() or np.any(self.durations <= 0):
+            raise ValueError("Provide three positive, finite phase durations")
+        if not all(np.isfinite(t) and t > 0 for t in (self.waypoint_tolerance, self.tracking_tolerance)):
+            raise ValueError("Trajectory tolerances must be positive and finite")
+        self.phase, self.elapsed = 0, 0.0
+
+    @property
+    def done(self):
+        return self.phase == 3
+
+    def sample(self, elapsed):
+        if self.done:
+            return self.waypoints[-1].copy()
+        u = np.clip(elapsed / self.durations[self.phase], 0.0, 1.0)
+        blend = u**3 * (10 - 15 * u + 6 * u**2)  # Zero endpoint velocity and acceleration.
+        return self.waypoints[self.phase] + blend * (self.waypoints[self.phase + 1] - self.waypoints[self.phase])
+
+    def propose(self, dt, hand):
+        elapsed = self.elapsed
+        if not self.done and np.linalg.norm(hand - self.sample(elapsed)) <= self.tracking_tolerance:
+            elapsed = min(elapsed + np.clip(dt, 0.0, 0.05), self.durations[self.phase])
+        return self.sample(elapsed), elapsed
+
+    def commit(self, elapsed, hand):
+        if self.done:
+            return
+        self.elapsed = elapsed
+        if elapsed >= self.durations[self.phase] and np.linalg.norm(hand - self.waypoints[self.phase + 1]) <= self.waypoint_tolerance:
+            self.phase += 1
+            self.elapsed = 0.0
+
+
 def estimate_base(local_points, fixed_points):
     """Fit the root pose from three noncollinear, stationary attachment points."""
     local, fixed = np.asarray(local_points), np.asarray(fixed_points)
@@ -266,8 +241,8 @@ def estimate_base(local_points, fixed_points):
     )
 
 
-def load_helios(urdf_path: Path, load_meshes: bool = True) -> yourdfpy.URDF:
-    model = yourdfpy.URDF.load(str(urdf_path), build_scene_graph=False).robot
+def load_helios(urdf_path):
+    model = yourdfpy.URDF.load(str(urdf_path), build_scene_graph=False, load_meshes=False).robot
     active = (
         {
             f"{joint}_{arm}"
@@ -299,19 +274,13 @@ def load_helios(urdf_path: Path, load_meshes: bool = True) -> yourdfpy.URDF:
                 origin=origin,
             )
         )
-    return yourdfpy.URDF(
-        model,
-        load_meshes=load_meshes,
-        filename_handler=lambda fname: str(
-            urdf_path.resolve().parents[2] / fname.removeprefix("package://")
-        ),
-    )
+    return yourdfpy.URDF(model, load_meshes=False)
 
 
 @jdc.jit
 def solve_ik(
     robot: pk.Robot, link_indices, targets, orientation_targets, previous_cfg, previous_base,
-    ru_attached: jdc.Static[bool] = False, orientation_weight=COST_WEIGHTS["fixed_orientations"], ik_to_world=None,
+    ru_attached: jdc.Static[bool] = False, ik_to_world=None,
 ):
     joint_var = robot.joint_var_cls(0)
     base_var = jaxls.SE3Var(0)
@@ -328,7 +297,7 @@ def solve_ik(
         local = jaxlie.SO3(robot.forward_kinematics(vals[var])[link_indices[fixed], :4])
         actual = vals[base].rotation() @ local
         error = (jaxlie.SO3(orientation_targets[fixed]).inverse() @ actual).log()
-        return (orientation_weight * error).flatten()
+        return (COST_WEIGHTS["fixed_orientations"] * error).flatten()
 
     @jaxls.Cost.factory
     def upright_cost(vals, base):
@@ -348,15 +317,8 @@ def solve_ik(
 
     @jaxls.Cost.factory
     def motion_cost(vals, var, base):
-        return (
-            jnp.concatenate(
-                [
-                    vals[var] - previous_cfg,
-                    (previous_base.inverse() @ vals[base]).log(),
-                ]
-            )
-            * COST_WEIGHTS["motion"]
-        )
+        motion = jnp.concatenate([vals[var] - previous_cfg, (previous_base.inverse() @ vals[base]).log()])
+        return motion * COST_WEIGHTS["motion"]
 
     terms = {
         "ru_position": jaxls.Cost.factory(position_residual)(joint_var, base_var, link_indices[:1], targets[:1]),
@@ -370,20 +332,9 @@ def solve_ik(
         "upright": upright_cost(base_var),
         "motion": motion_cost(joint_var, base_var),
     }
-    solution, summary = (
-        jaxls.LeastSquaresProblem(
-            costs=list(terms.values()),
-            variables=[joint_var, base_var],
-        )
-        .analyze()
-        .solve(
-            initial_vals=jaxls.VarValues.make(
-                [joint_var.with_value(previous_cfg), base_var.with_value(previous_base)]
-            ),
-            linear_solver="dense_cholesky",
-            verbose=False,
-            return_summary=True,
-        )
+    solution, summary = jaxls.LeastSquaresProblem(list(terms.values()), [joint_var, base_var]).analyze().solve(
+        initial_vals=jaxls.VarValues.make([joint_var.with_value(previous_cfg), base_var.with_value(previous_base)]),
+        linear_solver="dense_cholesky", verbose=False, return_summary=True,
     )
     # Evaluate the original terms, not the solver's changing AL penalties.
     costs = {}
@@ -393,68 +344,52 @@ def solve_ik(
             residual = jnp.maximum(residual, 0.0)
         costs[name] = jnp.sum(residual**2)
     costs["total_objective"] = sum(costs[name] for name, term in terms.items() if term.kind == "l2_squared")
-    # JAXLS records the same non-augmented objective at the initial guess.
-    # Keep the final value evaluated at `solution`: the last history entry can
-    # describe a rejected trial, or be truncated at the iteration limit.
     costs["initial_objective"] = summary.cost_history[0]
     return solution[joint_var], solution[base_var], summary.iterations, costs
 
 
 def main(
     urdf_path: Path = DEFAULT_URDF,
-    ros: bool = True,
-    joint_states_topic: str = "/joint_states",
-    joint_command_topic: str = "/joint_command",
-    command_mimics: bool = True,
-    auto_attach: bool = True,
     isaac_port: int = 8226,
-    trajectory_path: Path = Path(__file__).with_name("helios_trajectory.yaml"),
+    config_path: Path = Path(__file__).with_name("helios.yaml"),
     metrics_dir: Path = Path("helios_runs"),
     rviz: bool = True,
 ):
-    import yaml
-
-    if not ros:
-        raise ValueError("The headless trajectory controller requires ROS and the Isaac attachment helper")
-    motion = yaml.safe_load(trajectory_path.read_text())
+    config = yaml.safe_load(config_path.read_text())
+    motion, gains = config["trajectory"], config["gains"]
     clearance = float(motion.pop("clearance_m"))
-    orientation_weight = COST_WEIGHTS["fixed_orientations"]
     if not np.isfinite(clearance) or clearance <= 0:
         raise ValueError("clearance_m must be positive and finite (Isaac world +Y)")
     if not all(np.isfinite(value) and value >= 0 for value in COST_WEIGHTS.values()) or COST_WEIGHTS["position"] == 0:
         raise ValueError("Cost weights must be finite and nonnegative; position must be positive")
+    if not all(np.isfinite(value) and value >= 0 for value in gains.values()):
+        raise ValueError("Motor gains must be finite and nonnegative")
     # Validate settings before starting the helper or releasing anything.
     ClearanceTrajectory(np.zeros(3), np.zeros(3), [0, clearance, 0], **motion)
-    urdf = load_helios(urdf_path, load_meshes=False)
+    urdf = load_helios(urdf_path)
     robot = pk.Robot.from_urdf(urdf, default_joint_cfg=urdf.zero_cfg)
     indices = jnp.array([robot.links.names.index(f"ee_{arm}") for arm in HANDS])
-    command_names = list(robot.joints.actuated_names)
-    if command_mimics:
-        command_names += [j.name for j in urdf.robot.joints if j.mimic is not None and j.type != "fixed"]
+    command_names = [j.name for j in urdf.robot.joints if j.type != "fixed"]
     command_indices = jnp.array([robot.joints.names.index(name) for name in command_names])
-    # Include coupled joints even when Isaac supplies their commands itself.
-    effort_names = [j.name for j in urdf.robot.joints if j.type != "fixed"]
     run_settings = {
         "urdf": str(urdf_path), "trajectory": {"clearance_m": clearance, **motion},
-        "gains": yaml.safe_load(Path(__file__).with_name("helios_gains.yaml").read_text()) if auto_attach else "external helper",
-        "residual_weights": dict(COST_WEIGHTS),
+        "gains": gains, "residual_weights": dict(COST_WEIGHTS),
     }
     with TerminalKeys() as keys:
-        if auto_attach:
-            start_auto_attachment(isaac_port, effort_names)
-        bridge = IsaacBridge(robot.joints.actuated_names, joint_states_topic, joint_command_topic)
+        start_auto_attachment(isaac_port, command_names, gains)
+        bridge = IsaacBridge(robot.joints.actuated_names, "/joint_states", "/joint_command")
         try:
             from helios_rviz import RvizPoses
 
-            viewer = RvizPoses(bridge.node, urdf_path, effort_names) if rviz else None
+            viewer = RvizPoses(bridge.node, urdf_path, command_names) if rviz else None
             run_controller(robot, indices, command_names, command_indices, bridge, keys, clearance, motion,
-                           orientation_weight, metrics_dir, effort_names, run_settings, viewer)
+                           metrics_dir=metrics_dir, run_settings=run_settings, viewer=viewer)
         finally:
             bridge.close()
 
 
-def run_controller(robot, indices, command_names, command_indices, bridge, keys, clearance, motion, orientation_weight=COST_WEIGHTS["fixed_orientations"],
-                   metrics_dir=Path("helios_runs"), effort_names=None, run_settings=None, viewer=None):
+def run_controller(robot, indices, command_names, command_indices, bridge, keys, clearance, motion,
+                   metrics_dir=Path("helios_runs"), run_settings=None, viewer=None):
     print("Waiting for joint states and attachment helper; LU/RL/LL must be attached and settled. q: exit")
     deadline = time.monotonic() + 60.0
     while True:
@@ -484,12 +419,11 @@ def run_controller(robot, indices, command_names, command_indices, bridge, keys,
     last_command = 0.0
     last_sim_time = status["sim_time_s"]
     last_message = None
-    last_report = 0.0
     print("Compiling IK before enabling motion...")
     # Both attachment modes are static JIT specializations; compile before release.
     for attached in (False, True):
         warm_result = solve_ik(
-            robot, indices, jnp.asarray(targets), orientation_targets, cfg, base, attached, orientation_weight, ik_to_world
+            robot, indices, jnp.asarray(targets), orientation_targets, cfg, base, attached, ik_to_world
         )
         jax.block_until_ready(warm_result)
     keys.read()  # Discard keys pressed before the controller was ready.
@@ -527,31 +461,24 @@ def run_controller(robot, indices, command_names, command_indices, bridge, keys,
         measured_target = targets[0].copy()
         completed = False
 
-        if " " in pressed:
-            if mode == "idle":
-                start = np.asarray(base @ robot.forward_kinematics(cfg)[indices[:1], 4:])[0]
-                trajectory = ClearanceTrajectory(start, dock, offset, **motion)
-                command_id = uuid.uuid4().hex
-                settings = {**(run_settings or {}), "start_m": start.tolist(), "goal_m": dock.tolist()}
-                metrics = RolloutMetrics(metrics_dir, command_id, sim_time, effort_names or command_names, settings)
-                mode, last_command = "releasing", 0.0
-            else:
-                print("Transfer already running; Space ignored.")
+        if " " in pressed and mode == "idle":
+            start = np.asarray(base @ robot.forward_kinematics(cfg)[indices[:1], 4:])[0]
+            trajectory = ClearanceTrajectory(start, dock, offset, **motion)
+            command_id = uuid.uuid4().hex
+            settings = {**(run_settings or {}), "start_m": start.tolist(), "goal_m": dock.tolist()}
+            metrics = RolloutMetrics(metrics_dir, command_id, sim_time, command_names, settings)
+            mode, last_command = "releasing", 0.0
 
-        if mode == "releasing":
-            if status["command_id"] == command_id and not status["attached"] and not status["armed"]:
-                mode = "moving"
-                dt = 0.0
-            elif time.monotonic() - last_command >= 0.2:
-                bridge.command_attachment("release", command_id)
-                last_command = time.monotonic()
-        if mode == "docking":
-            if status["command_id"] == command_id and status["attached"]:
-                completed = True
+        if mode in ("releasing", "docking"):
+            acknowledged = status["command_id"] == command_id
+            completed = mode == "docking" and acknowledged and status["attached"]
+            if completed:
                 mode, trajectory = "idle", None
                 print("RU attached. Space: repeat using the scene's current RU target.")
+            elif mode == "releasing" and acknowledged and not status["attached"] and not status["armed"]:
+                mode, dt = "moving", 0.0
             elif time.monotonic() - last_command >= 0.2:
-                bridge.command_attachment("arm", command_id)
+                bridge.command_attachment("release" if mode == "releasing" else "arm", command_id)
                 last_command = time.monotonic()
 
         candidate_targets = targets.copy()
@@ -564,11 +491,10 @@ def run_controller(robot, indices, command_names, command_indices, bridge, keys,
             candidate_targets[0] = dock
 
         # Keep the previous solution as seed/reference; feedback only gates motion.
-        target_array = jnp.asarray(candidate_targets)
         solve_start = time.perf_counter()
         result = solve_ik(
-            robot, indices, target_array, orientation_targets, cfg, base,
-            status["attached"], orientation_weight, ik_to_world,
+            robot, indices, jnp.asarray(candidate_targets), orientation_targets, cfg, base,
+            status["attached"], ik_to_world,
         )
         candidate_cfg, candidate_base, steps, costs = jax.block_until_ready(result)
         solve_ms = (time.perf_counter() - solve_start) * 1000
@@ -604,12 +530,10 @@ def run_controller(robot, indices, command_names, command_indices, bridge, keys,
 
         message = mode if mode != "moving" else trajectory.phases[trajectory.phase]
         if not valid:
-            message += f": IK cannot track this step ({errors.max() * 1000:.1f} mm); holding"
-        elif mode == "moving":
-            message += f"; hand error {np.linalg.norm(hand - targets[0]) * 100:.1f} cm"
-        if message != last_message and time.monotonic() - last_report > 1.0:
+            message = "IK cannot track this step; holding"
+        if message != last_message:
             print(message)
-            last_message, last_report = message, time.monotonic()
+            last_message = message
         time.sleep(0.02)
 
 

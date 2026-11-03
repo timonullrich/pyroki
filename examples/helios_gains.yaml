@@ -1,3 +1,0 @@
-# Applied to all existing revolute/prismatic motor drives (raw USD units).
-stiffness: 10.0
-damping: 1.0

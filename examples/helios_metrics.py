@@ -52,9 +52,8 @@ class RolloutMetrics:
             "tracking_error_m": float(np.linalg.norm(np.asarray(hand) - target)),
             "ru_roll_rad": float(ru_roll_rad) if ru_roll_rad is not None else np.nan,
         }
-        for i, axis in enumerate("xyz"):
-            row[f"hand_{axis}_m"] = float(hand[i])
-            row[f"target_{axis}_m"] = float(target[i])
+        row.update({f"{name}_{axis}_m": float(value) for name, point in (("hand", hand), ("target", target))
+                    for axis, value in zip("xyz", point)})
         row.update({f"effort_nm/{name}": float(efforts.get(name, np.nan)) for name in self.effort_names})
         row.update({f"cost/{name}": float(value) for name, value in costs.items()})
         wrench = np.full(6, np.nan) if rl_wrist_wrench is None else np.asarray(rl_wrist_wrench, dtype=float)
@@ -98,10 +97,10 @@ class RolloutMetrics:
                 "computation": "Synchronized IK call including returned diagnostics; excludes JIT warmup, logging and plots.",
                 "steps": "jaxls SolveSummary.iterations per IK call, including rejected solves.",
                 "tracking": "Measured RU attachment-point position versus the previously published target at feedback sampling time.",
-                "ru_roll": "RU forearm direction (wrist parent frame +Z) projected into global Y-Z: atan2(direction_z, abs(direction_y)), 0 = horizontal along either +/-Y. Independent of wrist rotation. CSV in radians, plot in degrees. Missing samples are NaN.",
+                "ru_roll": "Wrist-parent +Z forearm tilt: atan2(world Z, abs(world Y)); horizontal = 0. CSV: rad, plot: degrees.",
                 "efforts": "Isaac get_measured_joint_efforts(), N m; missing samples are NaN, not zero.",
-                "rl_wrist": "Direct get_measured_joint_forces() at or4r_right_wrist: Fx/Fy/Fz in N and Tx/Ty/Tz in N m, expressed in the child joint frame. Missing readings are NaN. This is the transmitted wrist-joint wrench, not the external D6 attachment wrench.",
-                "costs": "The IK objective IS the sum of squared weighted soft residuals. total_objective is evaluated at the optimizer's returned solution; initial_objective is JAXLS's recorded value before solving. Hard-constraint curves show squared violations separately. These are model-space values, not measured Isaac tracking costs, and exclude internal augmented-Lagrangian penalties.",
+                "rl_wrist": "get_measured_joint_forces() at or4r_right_wrist, child joint frame: Fx/Fy/Fz (N), Tx/Ty/Tz (N m). Missing: NaN.",
+                "costs": "Sum of squared weighted soft residuals before/after solve, evaluated in the IK model. Hard violations are separate; internal AL penalties excluded.",
                 "sampling": "One row per active control-loop solve (release through attachment); latest Isaac sample may repeat.",
             },
         }
@@ -125,15 +124,9 @@ class RolloutMetrics:
             + (f"\nResidual weights: {weights}" if weights else "")
         )
         axes[0].plot(t, error * 1000, label="RU position error", color="black")
-        axes[0].set(title="Measured right-hand tracking error", ylabel="Error (mm)")
-        axes[0].legend(loc="upper left", bbox_to_anchor=(1, 1))
         for i, name in enumerate(self.effort_names):
             axes[1].plot(t, column(f"effort_nm/{name}"), label=name,
                          color=plt.get_cmap("tab20")(i % 20), linestyle="-" if i < 20 else "--", linewidth=1)
-        axes[1].set(title="Measured actuator efforts (fingers excluded)", ylabel="Effort (N·m)")
-        axes[1].legend(loc="upper left", bbox_to_anchor=(1, 1), fontsize=7, ncols=2)
-        if missing:
-            axes[1].text(0.01, 0.98, "Missing effort samples: see summary.json", transform=axes[1].transAxes, va="top")
         for key in self.rows[0]:
             if key.startswith("cost/"):
                 name = key.removeprefix("cost/")
@@ -145,27 +138,25 @@ class RolloutMetrics:
                 else:
                     label = name.replace("_violation", " (violation²)").replace("_", " ")
                     axes[2].plot(t, column(key), label=label, linestyle="--" if hard else "-", linewidth=1)
-        axes[2].set(title="IK objective before/after optimization and final term contributions",
-                    ylabel="Objective value / squared constraint violation", xlabel="Simulation time since trigger (s)")
         axes[2].set_yscale("symlog", linthresh=1e-8)
-        axes[2].legend(loc="upper left", bbox_to_anchor=(1, 1), fontsize=8)
-        for axis, values, title, unit, prefix in (
-            (axes[3], wrist_force, "Lower-right wrist transmitted force", "N", "F"),
-            (axes[4], wrist_torque, "Lower-right wrist transmitted torque", "N·m", "T"),
-        ):
+        for axis, values, prefix in ((axes[3], wrist_force, "F"), (axes[4], wrist_torque, "T")):
             for i, component in enumerate("xyz"):
                 axis.plot(t, values[:, i], label=f"{prefix}{component}")
             axis.plot(t, np.linalg.norm(values, axis=1), label="Magnitude", color="black", linestyle="--")
-            axis.set(title=f"{title} (child joint frame)", ylabel=unit)
-            axis.legend(loc="upper left", bbox_to_anchor=(1, 1))
-            if not wrist_valid.all():
-                axis.text(0.01, 0.98, "Missing wrist samples: see summary.json", transform=axis.transAxes, va="top")
-        axes[2].set_xlabel("")
         axes[5].plot(t, np.degrees(column("ru_roll_rad")), label="Measured forearm tilt")
         axes[5].axhline(0, color="gray", linestyle="--", label="Target (0°)")
-        axes[5].set(title="Measured RU forearm tilt in global Y-Z plane", ylabel="Tilt (°)", xlabel="Simulation time since trigger (s)")
-        axes[5].legend(loc="upper left", bbox_to_anchor=(1, 1))
-        for axis in axes:
+        labels = (
+            ("Measured RU tracking error", "Error (mm)"),
+            ("Measured actuator efforts (fingers excluded)", "Effort (N·m)"),
+            ("IK objective before/after solve and final terms", "Cost / violation²"),
+            ("Lower-right wrist force (child joint frame)", "Force (N)"),
+            ("Lower-right wrist torque (child joint frame)", "Torque (N·m)"),
+            ("Measured RU forearm tilt in global Y-Z", "Tilt (°)"),
+        )
+        axes[-1].set_xlabel("Simulation time since trigger (s)")
+        for i, (axis, (title, unit)) in enumerate(zip(axes, labels)):
+            axis.set(title=title, ylabel=unit)
+            axis.legend(loc="upper left", bbox_to_anchor=(1, 1), fontsize=7, ncols=2 if i == 1 else 1)
             for line in axis.lines:
                 line.set_ydata(smooth(line.get_ydata()))
             axis.relim()
@@ -173,8 +164,7 @@ class RolloutMetrics:
             axis.grid(True, alpha=0.25)
         fig.savefig(self.path / "metrics.png", dpi=160)
         plt.close(fig)
-        print(f"Metrics saved: {self.path} | mean IK {summary['average_computation_ms']:.2f} ms, "
-              f"mean steps {summary['average_solver_steps']:.1f}, RU RMSE {summary['tracking_rmse_mm']:.2f} mm")
+        print(f"Metrics saved: {self.path}")
         if missing:
             print(f"Effort data missing for some samples: {', '.join(missing)}")
         if not wrist_valid.all():

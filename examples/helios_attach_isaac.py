@@ -1,30 +1,7 @@
-"""Started from the terminal by helios_retargetiing.py --ros --auto-attach.
+"""Isaac-side attachment control and measured telemetry, installed by the launcher.
 
-Enable isaacsim.code_editor.python_server in Isaac first; start while STOPPED,
-then press Play. Alternatively, run this file in Isaac's Script Editor.
-
-Requires the ROS 2 Bridge and PhysX. Uses the live scene's D6 joint anchors,
-including mesh scale. Keeps attachment angular settings unchanged (rotation must
-be free). RU is enabled only after the controller arms docking and its two
-anchors are strictly less than 0.02 m apart.
-The launcher can temporarily override RU localPos0 with target_m (metres).
-With no body0, localPos0 is in world coordinates. Joint changes use a private
-temporary layer that is removed on shutdown; the saved asset is not modified.
-The terminal launcher also supplies helios_gains.yaml for all existing revolute
-and prismatic motor drives in the scene, using the same temporary layer.
-
-Publishes /helios/ru_attachment (std_msgs/String JSON): attached, distance_m,
-anchors_m (world-space body0 anchors in RU, LU, RL, LL order), hand_m,
-sim_time_s, armed, command_id, and efforts_nm from get_measured_joint_efforts().
-rl_wrist_wrench contains [Fx, Fy, Fz, Tx, Ty, Tz] from the lower-right wrist's
-get_measured_joint_forces() reading, in its child joint frame (N and N m).
-root_pose_wxyz_xyz is the measured articulation root pose in world metres.
-ru_roll_rad is the RU forearm tilt in the global Y-Z plane (0 = horizontal).
-The launcher supplies the non-finger motor names to measure. Receives commands on
-/helios/ru_attachment_command; release must be acknowledged before motion.
-The IK subscribes automatically; no additional OmniGraph nodes are needed.
-Stop, close(), or exit of the launching terminal process removes the helper and
-its temporary edits. Restart with --auto-attach after stopping the simulation.
+All overrides live in an anonymous session layer removed on Stop/process exit.
+No edits are written to the saved robot or scene.
 """
 
 import builtins
@@ -80,9 +57,7 @@ class HeliosAttachment:
         self.ru = self.joints[0]
         self.effort_names = effort_names or []
         self.articulation = None
-        self.effort_warning = False
         self.wrist_force_index = None
-        self.wrist_warning = False
         paths = {str(p) for j in self.joints for rel in (j.GetBody0Rel(), j.GetBody1Rel()) for p in rel.GetTargets()}
         self.ru_forearm_path = str(self.ru.GetBody1Rel().GetTargets()[0].GetParentPath())
         paths.add(self.ru_forearm_path)
@@ -149,12 +124,11 @@ class HeliosAttachment:
 
     def read_efforts(self):
         """Initialize after Play; report missing measurements as missing, never zero."""
-        if not self.effort_names:
-            return {}
         try:
+            if not self.effort_names:
+                return {}
             if self.articulation is None:
                 from isaacsim.core.prims import SingleArticulation
-
                 roots = [p.GetPath() for p in self.stage.Traverse() if p.HasAPI(UsdPhysics.ArticulationRootAPI)]
                 body = self.ru.GetBody1Rel().GetTargets()[0]
                 # Find the nearest enclosing robot subtree with one articulation.
@@ -167,31 +141,23 @@ class HeliosAttachment:
                     raise ValueError(f"Cannot identify Helios articulation: {matches}")
                 articulation = SingleArticulation(str(matches[0]), reset_xform_properties=False)
                 articulation.initialize()
-                self.effort_indices = np.array([
-                    i for i, name in enumerate(articulation.dof_names) if name in self.effort_names
-                ], dtype=int)
-                self.measured_names = [articulation.dof_names[i] for i in self.effort_indices]
-                if not self.measured_names:
-                    raise ValueError("No requested motor names match the Isaac articulation")
+                self.effort_indices = np.array([articulation.get_dof_index(name) for name in self.effort_names], dtype=int)
                 self.articulation = articulation
             efforts = self.articulation.get_measured_joint_efforts(joint_indices=self.effort_indices)
             if efforts is None:
                 raise ValueError("Isaac returned no measured joint efforts")
             values = np.asarray(efforts).reshape(-1)
-            if len(values) != len(self.measured_names):
+            if len(values) != len(self.effort_names):
                 raise ValueError("Unexpected measured-effort count")
-            return {name: float(value) for name, value in zip(self.measured_names, values) if np.isfinite(value)}
-        except Exception as error:
-            if not self.effort_warning:
-                print(f"Effort measurements unavailable (will retry): {error}")
-                self.effort_warning = True
+            return {name: float(value) for name, value in zip(self.effort_names, values) if np.isfinite(value)}
+        except Exception:
             return {}
 
     def read_rl_wrist_wrench(self):
         """Direct transmitted wrench at or4r_right_wrist, not a D6 force estimate."""
-        if self.articulation is None:
-            return None  # read_efforts initializes the shared articulation after Play.
         try:
+            if self.articulation is None:
+                return None  # read_efforts initializes the shared articulation after Play.
             if self.wrist_force_index is None:
                 metadata = self.articulation._articulation_view._metadata
                 # Force rows use articulation JOINT indices + 1 (row 0 is the
@@ -206,10 +172,7 @@ class HeliosAttachment:
             if wrench.shape != (6,) or not np.isfinite(wrench).all():
                 raise ValueError("Invalid wrist wrench")
             return wrench.tolist()
-        except Exception as error:
-            if not self.wrist_warning:
-                print(f"Lower-right wrist wrench unavailable (will retry): {error}")
-                self.wrist_warning = True
+        except Exception:
             return None
 
     def read_ru_roll(self):
@@ -224,9 +187,9 @@ class HeliosAttachment:
             return None
 
     def read_root_pose(self):
-        if self.articulation is None:
-            return None
         try:
+            if self.articulation is None:
+                return None
             position, orientation = self.articulation.get_world_pose()
             pose = np.concatenate((orientation, np.asarray(position) * self.metres))
             return pose.tolist() if pose.shape == (7,) and np.isfinite(pose).all() else None
@@ -301,9 +264,3 @@ def start_attachment(owner_pid=None, drive_gains=None, effort_names=None, target
         previous.close()
     builtins.helios_attachment = HeliosAttachment(owner_pid, drive_gains, effort_names, target_m)
     return builtins.helios_attachment
-
-
-if __name__ == "__main__":
-    if "helios_attachment" in globals():
-        helios_attachment.close()
-    helios_attachment = start_attachment()

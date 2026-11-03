@@ -1,8 +1,10 @@
 """Offline checks for the clearance path and Isaac attachment handshake."""
 
 import contextlib
+import builtins
 import io
 import json
+import os
 from pathlib import Path
 import runpy
 import sys
@@ -12,8 +14,46 @@ import unittest
 from unittest.mock import Mock, patch
 
 import numpy as np
+import jaxlie
 
-from examples.helios_trajectory import ClearanceTrajectory
+EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
+with patch.object(sys, "path", [str(EXAMPLES), *sys.path]):
+    CONTROLLER = runpy.run_path(str(EXAMPLES / "helios_retargetiing.py"))
+ClearanceTrajectory = CONTROLLER["ClearanceTrajectory"]
+
+
+class LauncherTests(unittest.TestCase):
+    def test_launcher_refuses_playing_and_passes_configuration_when_stopped(self):
+        source = "def start_attachment(*args):\n import builtins\n builtins._helios_test_args = args\n"
+        start = CONTROLLER["start_auto_attachment"]
+        request = Mock(return_value={})
+        gains = {"stiffness": 10.0, "damping": 1.0}
+        with patch.dict(start.__globals__, {"isaac_request": request}), patch("atexit.register"), \
+                patch.object(Path, "read_text", return_value=source):
+            start(8226, ["motor"], gains)
+        code = request.call_args.args[0]
+        timeline = SimpleNamespace(get_timeline_interface=lambda: SimpleNamespace(is_stopped=lambda: False))
+        with patch.dict(sys.modules, {"omni": SimpleNamespace(timeline=timeline), "omni.timeline": timeline}):
+            with self.assertRaisesRegex(RuntimeError, "Stop Isaac"):
+                exec(code, {})
+            timeline.get_timeline_interface = lambda: SimpleNamespace(is_stopped=lambda: True)
+            try:
+                exec(code, {})
+                self.assertEqual(builtins._helios_test_args, (os.getpid(), gains, ["motor"], CONTROLLER["RU_TARGET_M"]))
+            finally:
+                del builtins._helios_test_args
+
+    def test_shutdown_only_closes_this_process_helper(self):
+        stop = CONTROLLER["stop_auto_attachment"]
+        helper = SimpleNamespace(owner_pid=os.getpid() + 1, close=Mock())
+        request = lambda code, *_args, **_kwargs: exec(code, {})
+        with patch.object(builtins, "helios_attachment", helper, create=True), \
+                patch.dict(stop.__globals__, {"isaac_request": request}):
+            stop(8226)
+            helper.close.assert_not_called()
+            helper.owner_pid = os.getpid()
+            stop(8226)
+            helper.close.assert_called_once()
 
 
 class TrajectoryTests(unittest.TestCase):
@@ -104,10 +144,8 @@ class AttachmentTests(unittest.TestCase):
         helper.closed, helper.owner_pid = False, None
         helper.armed, helper.command_id = False, None
         helper.effort_names = []
-        helper.effort_warning = False
         helper.articulation = None
         helper.wrist_force_index = None
-        helper.wrist_warning = False
         helper.joints, helper.metres = [0, 1, 2, 3], 1.0
         helper.ros, helper.publisher, helper.node = Mock(), Mock(), Mock()
         helper.message_type = SimpleNamespace
@@ -163,7 +201,7 @@ class AttachmentTests(unittest.TestCase):
 
     def test_measured_efforts_use_selected_dof_indices(self):
         helper = self.helper
-        helper.effort_names = helper.measured_names = ["Shoulder1_RU", "right_wrist"]
+        helper.effort_names = ["Shoulder1_RU", "right_wrist"]
         helper.effort_indices = np.array([0, 2])
         helper.articulation = Mock()
         helper.articulation.get_measured_joint_efforts.return_value = np.array([-2.5, 1.5])
@@ -190,8 +228,6 @@ class AttachmentTests(unittest.TestCase):
         self.assertIsNone(self.update()["rl_wrist_wrench"])
 
     def test_ru_tilt_comes_from_forearm_not_hand(self):
-        import jaxlie
-
         helper = self.helper
         helper.ru_forearm_path = "/forearm"
         helper.use_backend = lambda *_args, **_kwargs: contextlib.nullcontext()
@@ -278,11 +314,10 @@ class ControllerTests(unittest.TestCase):
             rotations = rotations.at[0].set(jaxlie.SO3.from_z_radians(cfg[0]).wxyz)
             return jnp.hstack([rotations, positions])
 
-        def solve(_robot, _indices, targets, _orientations, cfg, _base, _attached, _orientation_weight, _ik_to_world):
+        def solve(_robot, _indices, targets, _orientations, cfg, _base, _attached, _ik_to_world):
             nonlocal seen_reattached
             seeds.append(np.array(cfg))
             orientation_refs.append(np.array(_orientations))
-            self.assertEqual(_orientation_weight, 25.0)
             seen_reattached = _attached and status["attached"]
             return jnp.array(targets[0]), jaxlie.SE3.identity(), jnp.array(5), {"total_objective": jnp.array(0.0)}
 
@@ -296,7 +331,7 @@ class ControllerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with patch.dict(run.__globals__, {"solve_ik": solve}), patch("time.sleep"), contextlib.redirect_stdout(io.StringIO()):
                 run(robot, jnp.arange(4), ["x", "y", "z"], jnp.arange(3), bridge, SimpleNamespace(read=key),
-                    0.15, settings, orientation_weight=25.0, metrics_dir=Path(directory), viewer=viewer)
+                    0.15, settings, metrics_dir=Path(directory), viewer=viewer)
             summaries = list(Path(directory).glob("*/summary.json"))
             self.assertEqual(len(summaries), 1)
             summary = json.loads(summaries[0].read_text())

@@ -1,8 +1,0 @@
-# Clearance is along Isaac WORLD +Y; final approach is along -Y.
-clearance_m: 0.15
-# Retreat, travel between bars, approach (simulation seconds).
-durations_s: [2.0, 3.0, 2.0]
-# Wait at each waypoint until the simulated hand reaches it.
-waypoint_tolerance_m: 0.02
-# Pause trajectory progress if the simulated hand falls behind its command.
-tracking_tolerance_m: 0.05

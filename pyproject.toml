@@ -34,12 +34,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+helios = ["PyYAML", "matplotlib"]
 dev = [
     "pyright>=1.1.308",
     "scikit-sparse",
     "ruff",
     "pytest",
-    "m2r2",
 ]
 
 [tool.ruff.lint]
@@ -69,3 +69,7 @@ ignore = [
     "PLW0603",  # Globa statement updates are discouraged.
     "PLW2901",  # For loop variable overwritten.
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# Optional ROS/Isaac dependencies load at runtime; numeric functions take explicit arrays.
+"examples/helios*.py" = ["PLC0415", "PLR0917"]
