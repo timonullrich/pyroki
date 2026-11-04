@@ -45,11 +45,11 @@ HANDS = {
 D6_OFFSET = (-0.005, 0.018122922877, 0.05950000114)
 # RU body0-local target in metres (world coordinates when body0 is empty).
 # Edit between runs; None uses the scene target.
-RU_TARGET_M = (-0.02, 0.265, 1.208)
+#RU_TARGET_M = (-0.02, 0.265, 1.208)Isaac Lab workflow: Enter comma-separated numbers: 2
 #RU_TARGET_M = (-0.02, 0.265, 1.408)
 #RU_TARGET_M = (-0.02, 0.265, 1.608)
 #RU_TARGET_M = (-0.02, 0.265, 2.0)
-#RU_TARGET_M = (0.28, 0.265, 1.408)
+RU_TARGET_M = (0.28, 0.265, 1.408)
 #RU_TARGET_M = (0.28, 0.265, 1.208)
 
 
@@ -57,7 +57,6 @@ RU_TARGET_M = (-0.02, 0.265, 1.208)
 COST_WEIGHTS = {
     "position": 1.0,  # Also scales the hard attached-position constraints.
     "fixed_orientations": 1.0,
-    "ru_roll": 0.0,  # Forearm tilt in the global Y-Z plane; 0 disables it.
     "upright": 0.0,
     "motion": 0.001,
 }
@@ -258,7 +257,7 @@ def load_helios(urdf_path):
 @jdc.jit
 def solve_ik(
     robot: pk.Robot, link_indices, targets, orientation_targets, previous_cfg, previous_base,
-    ru_attached: jdc.Static[bool] = False, ik_to_world=None,
+    ru_attached: jdc.Static[bool] = False,
 ):
     joint_var = robot.joint_var_cls(0)
     base_var = jaxls.SE3Var(0)
@@ -271,27 +270,15 @@ def solve_ik(
     def orientation_cost(vals, var, base):
         # Ordinary least-squares cost, never an equality constraint. Include the
         # floating-base rotation so these targets stay fixed in the IK frame.
-        fixed = slice(None) if ru_attached else slice(1, None)
-        local = jaxlie.SO3(robot.forward_kinematics(vals[var])[link_indices[fixed], :4])
+        local = jaxlie.SO3(robot.forward_kinematics(vals[var])[link_indices[1:], :4])
         actual = vals[base].rotation() @ local
-        error = (jaxlie.SO3(orientation_targets[fixed]).inverse() @ actual).log()
+        error = (jaxlie.SO3(orientation_targets[1:]).inverse() @ actual).log()
         return (COST_WEIGHTS["fixed_orientations"] * error).flatten()
 
     @jaxls.Cost.factory
     def upright_cost(vals, base):
         # Align torso Z with world Z; leave yaw and translation free.
         return (vals[base].rotation().as_matrix()[:, 2] - jnp.array([0.0, 0.0, 1.0])) * COST_WEIGHTS["upright"]
-
-    @jaxls.Cost.factory
-    def ru_roll_cost(vals, var, base):
-        forearm = robot.links.names.index("or2r_TopTower_Model_4a80d30e")  # Parent of the RU wrist joint.
-        rotation = vals[base].rotation() @ jaxlie.SO3(robot.forward_kinematics(vals[var])[forearm, :4])
-        if ik_to_world is not None:
-            rotation = ik_to_world @ rotation
-        matrix = rotation.as_matrix()
-        # This frame's +Z points along the forearm towards the wrist, before wrist rotation.
-        # Both +/-Y are horizontal. Epsilon handles a vanishing Y-Z projection.
-        return jnp.atleast_1d(COST_WEIGHTS["ru_roll"] * jnp.arctan2(matrix[2, 2], jnp.abs(matrix[1, 2]) + 1e-8))
 
     @jaxls.Cost.factory
     def motion_cost(vals, var, base):
@@ -305,7 +292,6 @@ def solve_ik(
             targets if ru_attached else targets[1:],
         ),
         "fixed_orientations": orientation_cost(joint_var, base_var),
-        "ru_roll": ru_roll_cost(joint_var, base_var),
         "joint_limits_violation": pk.costs.limit_constraint(robot, joint_var),
         "upright": upright_cost(base_var),
         "motion": motion_cost(joint_var, base_var),
@@ -380,9 +366,7 @@ def run_controller(robot, indices, command_names, command_indices, bridge, keys,
     initial_poses = robot.forward_kinematics(cfg)[indices]
     targets = np.array(initial_poses[:, 4:])
     orientation_targets = initial_poses[:, :4]
-    was_attached = status["attached"]
     world_to_ik = jaxlie.SE3(jnp.asarray(status["root_pose_wxyz_xyz"])).inverse()
-    ik_to_world = world_to_ik.rotation().inverse()
     offset = np.asarray(world_to_ik.rotation() @ jnp.array([0.0, clearance, 0.0]))
     trajectory = ClearanceTrajectory(targets[0], np.asarray(world_to_ik @ jnp.array(status["target_m"])), offset, **motion)
     metrics = None
@@ -393,7 +377,7 @@ def run_controller(robot, indices, command_names, command_indices, bridge, keys,
     # Both attachment modes are static JIT specializations; compile before release.
     for attached in (False, True):
         warm_result = solve_ik(
-            robot, indices, jnp.asarray(targets), orientation_targets, cfg, base, attached, ik_to_world
+            robot, indices, jnp.asarray(targets), orientation_targets, cfg, base, attached
         )
         jax.block_until_ready(warm_result)
     print(f"Starting: release → +Y {clearance:.2f} m → travel → -Y approach → attach. q: exit")
@@ -424,12 +408,6 @@ def run_controller(robot, indices, command_names, command_indices, bridge, keys,
             settings = {**(run_settings or {}), "start_m": targets[0].tolist(), "goal_m": dock.tolist(),
                         "target_world_m": np.asarray(status["target_m"]).tolist()}
             metrics = RolloutMetrics(metrics_dir, uuid.uuid4().hex, sim_time, command_names, settings)
-        if status["attached"] and not was_attached:
-            # Latch the last commanded RU orientation once, without reseeding IK
-            # from measured joints or pulling RU back to its pre-transfer pose.
-            ru_rotation = base.rotation() @ jaxlie.SO3(robot.forward_kinematics(cfg)[indices[0], :4])
-            orientation_targets = orientation_targets.at[0].set(ru_rotation.wxyz)
-        was_attached = status["attached"]
         # This feedback precedes the new command: compare it with the last target.
         measured_target = targets[0].copy()
         completed = trajectory is not None and not waiting_for_release and status["attached"]
@@ -451,7 +429,7 @@ def run_controller(robot, indices, command_names, command_indices, bridge, keys,
         solve_start = time.perf_counter()
         result = solve_ik(
             robot, indices, jnp.asarray(candidate_targets), orientation_targets, cfg, base,
-            status["attached"], ik_to_world,
+            status["attached"],
         )
         candidate_cfg, candidate_base, steps, costs = jax.block_until_ready(result)
         solve_ms = (time.perf_counter() - solve_start) * 1000

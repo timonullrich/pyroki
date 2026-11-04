@@ -305,7 +305,7 @@ class ControllerTests(unittest.TestCase):
             rotations = rotations.at[0].set(jaxlie.SO3.from_z_radians(cfg[0]).wxyz)
             return jnp.hstack([rotations, positions])
 
-        def solve(_robot, _indices, targets, _orientations, cfg, _base, _attached, _ik_to_world):
+        def solve(_robot, _indices, targets, _orientations, cfg, _base, _attached):
             nonlocal seen_reattached
             seeds.append(np.array(cfg))
             orientation_refs.append(np.array(_orientations))
@@ -338,9 +338,8 @@ class ControllerTests(unittest.TestCase):
         self.assertIs(viewer.publish.call_args.args[2], bridge.state[0])
         self.assertEqual(viewer.publish.call_args.args[3], status["root_pose_wxyz_xyz"])
         np.testing.assert_allclose(viewer.publish.call_args.args[1].wxyz_xyz, root.wxyz_xyz, atol=1e-6)
-        # Support references stay latched; RU latches its new orientation on docking.
+        # Support references stay latched.
         np.testing.assert_allclose(np.array(orientation_refs)[:, 1:], np.tile([1, 0, 0, 0], (len(orientation_refs), 3, 1)))
-        np.testing.assert_allclose(orientation_refs[-1][0], jaxlie.SO3.from_z_radians(goal[0]).wxyz, atol=1e-6)
         self.assertLess(np.max(np.abs(seeds)), 1)  # Never reseeded from the 99-valued feedback.
         samples = np.array(published)
         offset = np.asarray(root.rotation().inverse() @ np.array([0., 0.15, 0.]))
