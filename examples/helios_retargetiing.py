@@ -1,4 +1,4 @@
-"""Helios ROS IK. Start with Isaac stopped, then Play; Space transfers RU, q exits.
+"""Helios ROS IK. Start with Isaac stopped, then Play; RU transfers automatically, q exits.
 
 Joint feedback initializes IK once; measured hand motion gates the clearance path.
 Attachments, gains and target overrides use a removable Isaac session layer.
@@ -42,17 +42,24 @@ HANDS = {
 }
 # scene_helios_v0.usd: each D6's body1 anchor, transformed from its mesh
 # frame into its URDF palm frame, including the mesh's 0.001 scale (metres).
-D6_OFFSET = (-0.005, 0.018122922877, 0.04950000067)
+D6_OFFSET = (-0.005, 0.018122922877, 0.05950000114)
 # RU body0-local target in metres (world coordinates when body0 is empty).
 # Edit between runs; None uses the scene target.
-RU_TARGET_M = (0.28, 0.265, 1.408)
+RU_TARGET_M = (-0.02, 0.265, 1.208)
+#RU_TARGET_M = (-0.02, 0.265, 1.408)
+#RU_TARGET_M = (-0.02, 0.265, 1.608)
+#RU_TARGET_M = (-0.02, 0.265, 2.0)
+#RU_TARGET_M = (0.28, 0.265, 1.408)
+#RU_TARGET_M = (0.28, 0.265, 1.208)
+
+
 # Residual multipliers: each soft cost is sum((weight * error)**2).
 COST_WEIGHTS = {
-    "position": 50.0,  # Also scales the hard attached-position constraints.
-    "fixed_orientations": 25.0,
+    "position": 1.0,  # Also scales the hard attached-position constraints.
+    "fixed_orientations": 1.0,
     "ru_roll": 0.0,  # Forearm tilt in the global Y-Z plane; 0 disables it.
     "upright": 0.0,
-    "motion": 0.05,
+    "motion": 0.001,
 }
 
 
@@ -80,7 +87,7 @@ def start_auto_attachment(port, effort_names, gains):
     )
     response = isaac_request(code, port)
     print(response.get("output", ""), end="")
-    print("Attachment helper is running in Isaac. Press Play, then wait for the Space-key prompt.")
+    print("Attachment helper is running in Isaac. Press Play; motion starts after initialization.")
 
 
 class IsaacBridge:
@@ -154,7 +161,7 @@ class TerminalKeys:
 
     def __enter__(self):
         if not sys.stdin.isatty():
-            raise RuntimeError("Run this script in an interactive terminal for Space/q controls")
+            raise RuntimeError("Run this script in an interactive terminal for q to exit")
         self.fd = sys.stdin.fileno()
         self.settings = termios.tcgetattr(self.fd)
         tty.setcbreak(self.fd)
@@ -377,9 +384,9 @@ def run_controller(robot, indices, command_names, command_indices, bridge, keys,
     world_to_ik = jaxlie.SE3(jnp.asarray(status["root_pose_wxyz_xyz"])).inverse()
     ik_to_world = world_to_ik.rotation().inverse()
     offset = np.asarray(world_to_ik.rotation() @ jnp.array([0.0, clearance, 0.0]))
-    trajectory = None
+    trajectory = ClearanceTrajectory(targets[0], np.asarray(world_to_ik @ jnp.array(status["target_m"])), offset, **motion)
     metrics = None
-    waiting_for_release = False
+    waiting_for_release = True
     last_sim_time = status["sim_time_s"]
     last_message = None
     print("Compiling IK before enabling motion...")
@@ -389,12 +396,10 @@ def run_controller(robot, indices, command_names, command_indices, bridge, keys,
             robot, indices, jnp.asarray(targets), orientation_targets, cfg, base, attached, ik_to_world
         )
         jax.block_until_ready(warm_result)
-    keys.read()  # Discard keys pressed before the controller was ready.
-    print(f"Ready. Space: release → +Y {clearance:.2f} m → travel → -Y approach → attach. q: exit")
+    print(f"Starting: release → +Y {clearance:.2f} m → travel → -Y approach → attach. q: exit")
 
     while True:
-        pressed = keys.read().lower()
-        if "q" in pressed:
+        if "q" in keys.read().lower():
             if metrics is not None:
                 metrics.save("interrupted")
             return
@@ -414,6 +419,11 @@ def run_controller(robot, indices, command_names, command_indices, bridge, keys,
         last_sim_time = sim_time
         hand = np.asarray(world_to_ik @ jnp.array(status["hand_m"]))
         dock = np.asarray(world_to_ik @ jnp.array(status["target_m"]))
+        if metrics is None and trajectory is not None:
+            bridge.release()
+            settings = {**(run_settings or {}), "start_m": targets[0].tolist(), "goal_m": dock.tolist(),
+                        "target_world_m": np.asarray(status["target_m"]).tolist()}
+            metrics = RolloutMetrics(metrics_dir, uuid.uuid4().hex, sim_time, command_names, settings)
         if status["attached"] and not was_attached:
             # Latch the last commanded RU orientation once, without reseeding IK
             # from measured joints or pulling RU back to its pre-transfer pose.
@@ -425,18 +435,10 @@ def run_controller(robot, indices, command_names, command_indices, bridge, keys,
         completed = trajectory is not None and not waiting_for_release and status["attached"]
         if completed:
             trajectory = None
-            print("RU attached. Space: repeat.")
+            print("RU attached.")
         if waiting_for_release:
             waiting_for_release = status["attached"]
             dt = 0.0
-
-        if " " in pressed and trajectory is None and not completed:
-            bridge.release()
-            start = np.asarray(base @ robot.forward_kinematics(cfg)[indices[:1], 4:])[0]
-            trajectory = ClearanceTrajectory(start, dock, offset, **motion)
-            settings = {**(run_settings or {}), "start_m": start.tolist(), "goal_m": dock.tolist()}
-            metrics = RolloutMetrics(metrics_dir, uuid.uuid4().hex, sim_time, command_names, settings)
-            waiting_for_release = True
 
         candidate_targets = targets.copy()
         proposed_elapsed = 0.0

@@ -12,7 +12,7 @@ python examples/helios_retargetiing.py
 ```
 
 Start the controller with Isaac **stopped**, then press Play. LU/RL/LL must
-be attached and the fingers held at zero. Space releases RU, retreats along
+be attached and the fingers held at zero. After initialization, RU automatically releases, retreats along
 world +Y, travels with clearance, approaches along -Y, and automatically
 reattaches within 2 cm. A released hand must first leave that radius.
 Press q or Ctrl+C to exit. Restart after resetting the scene.
@@ -40,7 +40,7 @@ The ROS topics are `/joint_states` and `/joint_command`; coupled joints are comm
 
 Each transfer saves `summary.json`, `rollout.csv` and `metrics.png` under
 `helios_runs/` (`--metrics-dir` overrides this). CSV uses semicolons; exported
-floats use four significant figures. Only plots are smoothed. Missing sensor
+floats use four significant figures. The summary includes the destination in world metres (`settings.target_world_m`). Only plots are smoothed. Missing sensor
 readings are NaN. Costs before/after solving are the model's soft objective;
 hard-constraint violations are shown separately.
 

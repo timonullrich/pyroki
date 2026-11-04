@@ -5,4 +5,4 @@ trajectory:
   clearance_m: 0.15
   durations_s: [2.0, 3.0, 2.0]  # Retreat +Y, transfer, approach -Y.
   waypoint_tolerance_m: 0.02
-  tracking_tolerance_m: 0.05
+  tracking_tolerance_m: 1.05

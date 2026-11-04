@@ -245,7 +245,7 @@ class AttachmentTests(unittest.TestCase):
 
 
 class ControllerTests(unittest.TestCase):
-    def test_key_release_clearance_then_autoattachment(self):
+    def test_automatic_release_clearance_then_autoattachment(self):
         self.check_transfer(jaxlie.SE3.identity())
 
     def test_initial_world_transform_uses_isaac_root_pose_once(self):
@@ -297,8 +297,6 @@ class ControllerTests(unittest.TestCase):
             key_reads += 1
             if key_reads > 100:
                 self.fail("Controller did not complete the transfer")
-            if key_reads in (2, 3):  # Second press while running must be ignored.
-                return " "
             return "q" if seen_reattached else ""
 
         def fk(cfg):
@@ -329,6 +327,7 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(len(summaries), 1)
             summary = json.loads(summaries[0].read_text())
             self.assertEqual(summary["outcome"], "completed")
+            np.testing.assert_allclose(summary["settings"]["target_world_m"], root @ goal, rtol=5e-4, atol=5e-5)
             self.assertEqual(summary["average_solver_steps"], 5)
             self.assertEqual(summary["ik_calls"], len(seeds) - 2)  # Warmup excluded.
             self.assertEqual(summary["rl_wrist"]["valid_samples"], summary["ik_calls"])
