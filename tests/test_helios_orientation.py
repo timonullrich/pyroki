@@ -18,7 +18,7 @@ class OrientationTests(unittest.TestCase):
     def setUpClass(cls):
         examples = Path(__file__).resolve().parents[1] / "examples"
         with patch.object(sys, "path", [str(examples), *sys.path]):
-            module = runpy.run_path(str(examples / "helios_retargetiing.py"))
+            module = runpy.run_path(str(examples / "helios_retargeting.py"))
         cls.solve = staticmethod(module["solve_ik"])
         cls.weights = module["COST_WEIGHTS"]
         cls.weights["position"] = 50.0

@@ -8,7 +8,7 @@ ROS Jazzy and Isaac Sim with its ROS 2 Bridge and
 source /opt/ros/jazzy/setup.bash
 source .venv/bin/activate
 python -m pip install -e '.[helios]'
-python examples/helios_retargetiing.py
+python examples/helios_retargeting.py
 ```
 
 Start the controller with Isaac **stopped**, then press Play. LU/RL/LL must
@@ -19,8 +19,11 @@ Press q or Ctrl+C to exit. Restart after resetting the scene.
 
 Configuration:
 
-- `examples/helios_retargetiing.py`: `RU_TARGET_M`, `D6_OFFSET`, `COST_WEIGHTS`.
-- `examples/helios.yaml`: motor gains, clearance, durations and tracking tolerances.
+- `examples/helios_retargeting.py`: `RU_TARGET_M`, `D6_OFFSET`, `COST_WEIGHTS`.
+- `examples/helios.yaml`: actuators, clearance, durations and tracking tolerances.
+  `actuators` uses Isaac Lab `ImplicitActuatorCfg` fields and SI units (per radian),
+  matching `helios_rl`'s `helios.py`. Each controller start writes them, converted to
+  USD's per-degree drive units, into the temporary session layer for every matched joint.
 
 Target, gain and attachment overrides are temporary. Stop Isaac or exit the
 controller to remove them before editing the underlying scene target.

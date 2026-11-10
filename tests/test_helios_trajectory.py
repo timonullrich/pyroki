@@ -18,7 +18,7 @@ import jaxlie
 
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
 with patch.object(sys, "path", [str(EXAMPLES), *sys.path]):
-    CONTROLLER = runpy.run_path(str(EXAMPLES / "helios_retargetiing.py"))
+    CONTROLLER = runpy.run_path(str(EXAMPLES / "helios_retargeting.py"))
 ClearanceTrajectory = CONTROLLER["ClearanceTrajectory"]
 
 
@@ -27,10 +27,10 @@ class LauncherTests(unittest.TestCase):
         source = "def start_attachment(*args):\n import builtins\n builtins._helios_test_args = args\n"
         start = CONTROLLER["start_auto_attachment"]
         request = Mock(return_value={})
-        gains = {"stiffness": 10.0, "damping": 1.0}
+        actuators = {"body": {"joint_names_expr": ["motor"], "stiffness": 71.1}}
         with patch.dict(start.__globals__, {"isaac_request": request}), \
                 patch.object(Path, "read_text", return_value=source):
-            start(8226, ["motor"], gains)
+            start(8226, ["motor"], actuators)
         code = request.call_args.args[0]
         timeline = SimpleNamespace(get_timeline_interface=lambda: SimpleNamespace(is_stopped=lambda: False))
         with patch.dict(sys.modules, {"omni": SimpleNamespace(timeline=timeline), "omni.timeline": timeline}):
@@ -39,7 +39,7 @@ class LauncherTests(unittest.TestCase):
             timeline.get_timeline_interface = lambda: SimpleNamespace(is_stopped=lambda: True)
             try:
                 exec(code, {})
-                self.assertEqual(builtins._helios_test_args, (os.getpid(), gains, ["motor"], CONTROLLER["RU_TARGET_M"]))
+                self.assertEqual(builtins._helios_test_args, (os.getpid(), actuators, ["motor"], CONTROLLER["RU_TARGET_M"]))
             finally:
                 del builtins._helios_test_args
 
@@ -255,7 +255,7 @@ class ControllerTests(unittest.TestCase):
     def check_transfer(self, root):
         examples = Path(__file__).resolve().parents[1] / "examples"
         with patch.object(sys, "path", [str(examples), *sys.path]):
-            module = runpy.run_path(str(examples / "helios_retargetiing.py"))
+            module = runpy.run_path(str(examples / "helios_retargeting.py"))
         jnp, jaxlie = module["jnp"], module["jaxlie"]
         supports = np.array([[1, 0, 0], [0, 0, 1], [-1, 0, 0]])
         goal = np.array([0.2, 0, 0.3])

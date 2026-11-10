@@ -18,7 +18,7 @@ from scipy.spatial.transform import Rotation
 import tyro
 import yourdfpy
 
-from helios_retargetiing import DEFAULT_URDF, HANDS, load_helios
+from helios_retargeting import DEFAULT_URDF, HANDS, load_helios
 
 
 DEFAULT_SCENE = Path(__file__).resolve().parents[2] / "Thesis/assests/scene_helios_v0.usd"

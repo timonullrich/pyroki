@@ -7,11 +7,73 @@ No edits are written to the saved robot or scene.
 import builtins
 import json
 import os
+import re
 
 import numpy as np
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
 
 ATTACH_DISTANCE = 0.02
+ACTUATOR_PARAMS = ("stiffness", "damping", "friction", "armature", "joint_effort_limit", "joint_velocity_limit")
+
+
+def resolve_actuators(joint_names, actuators):
+    """Per-joint SI values with Isaac Lab ImplicitActuatorCfg matching rules.
+
+    Patterns full-match joint names; every pattern must match something, and no
+    joint may belong to two groups or match two patterns of one parameter.
+    """
+    resolved = {}
+    for group, cfg in actuators.items():
+        unknown = set(cfg) - {"joint_names_expr", *ACTUATOR_PARAMS}
+        if unknown:
+            raise ValueError(f"Actuator group {group}: unknown fields {sorted(unknown)}")
+        members = []
+        for pattern in cfg["joint_names_expr"]:
+            matched = [name for name in joint_names if re.fullmatch(pattern, name)]
+            if not matched:
+                raise ValueError(f"Actuator group {group}: {pattern!r} matches no joint")
+            members += [name for name in matched if name not in members]
+        for name in members:
+            if name in resolved:
+                raise ValueError(f"Joint {name} is in more than one actuator group")
+            resolved[name] = {}
+        for param in ACTUATOR_PARAMS:
+            values = cfg.get(param)
+            if values is None:
+                continue
+            for pattern, value in (values if isinstance(values, dict) else {".*": values}).items():
+                value = float(value)
+                if not np.isfinite(value) or value < 0:
+                    raise ValueError(f"Actuator group {group}: {param} must be finite and nonnegative")
+                matched = [name for name in members if re.fullmatch(pattern, name)]
+                if not matched:
+                    raise ValueError(f"Actuator group {group}: {param} pattern {pattern!r} matches no joint")
+                for name in matched:
+                    if param in resolved[name]:
+                        raise ValueError(f"Joint {name}: {param} matches more than one pattern")
+                    resolved[name][param] = value
+    return resolved
+
+
+def apply_actuator(prim, params):
+    """Author SI actuator values on a joint; USD angular drives use degrees."""
+    angular = prim.IsA(UsdPhysics.RevoluteJoint)
+    per_rad = np.pi / 180.0 if angular else 1.0
+    drive = UsdPhysics.DriveAPI.Apply(prim, "angular" if angular else "linear")
+    physx = {"friction": "jointFriction", "armature": "armature", "joint_velocity_limit": "maxJointVelocity"}
+    if physx.keys() & params.keys():
+        prim.AddAppliedSchema("PhysxJointAPI")
+    for param, value in params.items():
+        if param == "stiffness":
+            drive.CreateStiffnessAttr(value * per_rad)  # N·m/rad -> N·m/deg
+        elif param == "damping":
+            drive.CreateDampingAttr(value * per_rad)  # N·m·s/rad -> N·m·s/deg
+        elif param == "joint_effort_limit":
+            drive.CreateMaxForceAttr(value)  # N·m, no angle unit
+        else:
+            # rad/s -> deg/s; friction coefficient and armature are not per angle.
+            value = value / per_rad if param == "joint_velocity_limit" else value
+            prim.CreateAttribute(f"physxJoint:{physx[param]}", Sdf.ValueTypeNames.Float).Set(value)
 
 
 def anchor_position(joint, side, transform_point):
@@ -22,7 +84,7 @@ def anchor_position(joint, side, transform_point):
 
 
 class HeliosAttachment:
-    def __init__(self, owner_pid, drive_gains, effort_names, target_m=None):
+    def __init__(self, owner_pid, actuators, effort_names, target_m=None):
         import carb
         import omni.kit.app
         import omni.timeline
@@ -52,6 +114,14 @@ class HeliosAttachment:
         if self.backend == "usd" and settings.get("/physics/updateToUsd") is False:
             raise RuntimeError("Enable physics updateToUsd or Fabric Scene Delegate to read live hand poses")
         self.metres = UsdGeom.GetStageMetersPerUnit(self.stage)
+        driven = [p for p in self.stage.Traverse() if p.IsA(UsdPhysics.RevoluteJoint) or p.IsA(UsdPhysics.PrismaticJoint)]
+        if len({p.GetName() for p in driven}) != len(driven):
+            raise ValueError("Actuator patterns need unique joint names in the stage")
+        driven = {p.GetName(): p for p in driven}
+        actuator_values = resolve_actuators(list(driven), actuators)
+        unconfigured = sorted(set(driven) - set(actuator_values))
+        if unconfigured:
+            print(f"Keeping scene drive settings for {len(unconfigured)} joints: {', '.join(unconfigured)}")
         if target_m is not None:
             target_m = np.asarray(target_m, dtype=float)
             if target_m.shape != (3,) or not np.isfinite(target_m).all():
@@ -69,12 +139,10 @@ class HeliosAttachment:
             self.ru.CreateExcludeFromArticulationAttr(True)
             if target_m is not None:
                 self.ru.CreateLocalPos0Attr(Gf.Vec3f(*(target_m / self.metres)))
-            for prim in self.stage.Traverse():
-                if prim.IsA(UsdPhysics.RevoluteJoint) or prim.IsA(UsdPhysics.PrismaticJoint):
-                    for drive in UsdPhysics.DriveAPI.GetAll(prim):
-                        drive.CreateStiffnessAttr(drive_gains["stiffness"])
-                        drive.CreateDampingAttr(drive_gains["damping"])
+            for name, params in actuator_values.items():
+                apply_actuator(driven[name], params)
         self.subscription = omni.kit.app.get_app().get_update_event_stream().create_subscription_to_pop(self.update)
+        print(f"Actuator settings applied to {len(actuator_values)} joints")
         print(f"RU auto-attachment ready: distance < {ATTACH_DISTANCE} m")
 
     def release(self):
@@ -200,9 +268,9 @@ class HeliosAttachment:
         print("RU auto-attach stopped; temporary joint overrides removed")
 
 
-def start_attachment(owner_pid, drive_gains, effort_names, target_m=None):
+def start_attachment(owner_pid, actuators, effort_names, target_m=None):
     previous = getattr(builtins, "helios_attachment", None)
     if previous is not None:
         previous.close()
-    builtins.helios_attachment = HeliosAttachment(owner_pid, drive_gains, effort_names, target_m)
+    builtins.helios_attachment = HeliosAttachment(owner_pid, actuators, effort_names, target_m)
     return builtins.helios_attachment

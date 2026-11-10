@@ -1,6 +1,70 @@
-gains:
-  stiffness: 10.0
-  damping: 1.0
+# Same fields and semantics as Isaac Lab's ImplicitActuatorCfg (helios_rl helios.py),
+# in SI units: N·m/rad, N·m·s/rad, N·m, rad/s, kg·m². Converted to USD degree units in Isaac.
+# Patterns are full-match regexes on USD joint names. Each value is a scalar or {pattern: value}.
+# Omitted fields and unmatched joints keep the scene's USD values.
+actuators:
+  body:
+    joint_names_expr:
+      - "Shoulder[123]_(RU|LU|RL|LL)"
+      - "Ua_(RU|LU|RL|LL)"
+      - "Rcj[12]_(RU|LU|RL|LL)"
+      - "(Yaw|Roll)_HIP"
+    joint_effort_limit: 100.0  # N·m; matches the source URDF.
+    joint_velocity_limit: 5.0  # rad/s; provisional simulation limit.
+    stiffness: 71.1
+    damping: 7.54
+  fingers:
+    # Apply to all four hands. USD m1/m2 are ring/middle fingers.
+    # USD thumb_mcp is the basal CMC joint; thumb_pip is the supplied MCP joint.
+    joint_names_expr:
+      - ".*_(pinky|m1|m2|index|thumb)_(abd|mcp|pip|dip)"
+      - ".*_wrist"
+    stiffness:
+      ".*_(index|m1|m2|pinky)_abd": 9.7
+      ".*_(index|m1|m2|pinky)_mcp": 11.8
+      ".*_(index|m1|m2|pinky)_pip": 14.4
+      ".*_thumb_mcp": 14.1
+      ".*_thumb_abd": 15.0
+      ".*_thumb_pip": 3.5
+      ".*_thumb_dip": 3.5
+      ".*_wrist": 12.0
+    damping:
+      ".*_(index|m1|m2|pinky)_abd": 0.74
+      ".*_(index|m1|m2|pinky)_mcp": 1.2
+      ".*_(index|m1|m2|pinky)_pip": 2.05
+      ".*_thumb_mcp": 1.76
+      ".*_thumb_abd": 1.37
+      ".*_thumb_pip": 0.42
+      ".*_thumb_dip": 0.42
+      ".*_wrist": 0.85
+    # Supplied provisional friction values (halved from v1b identification).
+    friction:
+      ".*_(index|m1|m2|pinky)_abd": 0.039
+      ".*_(index|m1|m2|pinky)_mcp": 0.003
+      ".*_(index|m1|m2|pinky)_pip": 0.00035
+      ".*_thumb_mcp": 0.0
+      ".*_thumb_abd": 0.0155
+      ".*_thumb_pip": 0.0
+      ".*_thumb_dip": 0.0
+      ".*_wrist": 0.105
+    armature: 
+      ".*_(index|m1|m2|pinky)_abd": 0.0005
+      ".*_(index|m1|m2|pinky)_mcp": 0.0005
+      ".*_(index|m1|m2|pinky)_pip": 0.0005
+      ".*_thumb_mcp": 0.0005
+      ".*_thumb_abd": 0.0005
+      ".*_thumb_pip": 0.0005
+      ".*_thumb_dip": 0.0005
+      ".*_wrist": 0.0005
+    joint_effort_limit:
+      ".*_(index|m1|m2|pinky)_abd": 0.66
+      ".*_(index|m1|m2|pinky)_mcp": 0.78
+      ".*_(index|m1|m2|pinky)_pip": 1.29
+      ".*_thumb_mcp": 1.09
+      ".*_thumb_abd": 0.58
+      ".*_thumb_pip": 1.95
+      ".*_thumb_dip": 1.95
+      ".*_wrist": 1.95
 trajectory:
   clearance_m: 0.15
   durations_s: [2.0, 3.0, 2.0]  # Retreat +Y, transfer, approach -Y.

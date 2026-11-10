@@ -1,7 +1,7 @@
 """Helios ROS IK. Start with Isaac stopped, then Play; RU transfers automatically, q exits.
 
 Joint feedback initializes IK once; measured hand motion gates the clearance path.
-Attachments, gains and target overrides use a removable Isaac session layer.
+Attachments, actuator settings and target overrides use a removable Isaac session layer.
 Run instructions and configuration: README.md.
 """
 
@@ -74,7 +74,7 @@ def isaac_request(code, port, timeout=30.0):
     return response
 
 
-def start_auto_attachment(port, effort_names, gains):
+def start_auto_attachment(port, effort_names, actuators):
     source = Path(__file__).with_name("helios_attach_isaac.py").read_text()
     code = (
         "import omni.timeline\n"
@@ -82,7 +82,7 @@ def start_auto_attachment(port, effort_names, gains):
         "    raise RuntimeError('Stop Isaac before starting auto-attach, then press Play')\n"
         "_helios = {'__name__': '_helios_attachment'}\n"
         f"exec(compile({source!r}, 'helios_attach_isaac.py', 'exec'), _helios)\n"
-        f"_helios['start_attachment']({os.getpid()}, {gains!r}, {effort_names!r}, {RU_TARGET_M!r})\n"
+        f"_helios['start_attachment']({os.getpid()}, {actuators!r}, {effort_names!r}, {RU_TARGET_M!r})\n"
     )
     response = isaac_request(code, port)
     print(response.get("output", ""), end="")
@@ -320,14 +320,12 @@ def main(
     rviz: bool = True,
 ):
     config = yaml.safe_load(config_path.read_text())
-    motion, gains = config["trajectory"], config["gains"]
+    motion, actuators = config["trajectory"], config["actuators"]
     clearance = float(motion.pop("clearance_m"))
     if not np.isfinite(clearance) or clearance <= 0:
         raise ValueError("clearance_m must be positive and finite (Isaac world +Y)")
     if not all(np.isfinite(value) and value >= 0 for value in COST_WEIGHTS.values()) or COST_WEIGHTS["position"] == 0:
         raise ValueError("Cost weights must be finite and nonnegative; position must be positive")
-    if not all(np.isfinite(value) and value >= 0 for value in gains.values()):
-        raise ValueError("Motor gains must be finite and nonnegative")
     # Validate settings before starting the helper or releasing anything.
     ClearanceTrajectory(np.zeros(3), np.zeros(3), [0, clearance, 0], **motion)
     urdf = load_helios(urdf_path)
@@ -337,10 +335,10 @@ def main(
     command_indices = jnp.array([robot.joints.names.index(name) for name in command_names])
     run_settings = {
         "urdf": str(urdf_path), "trajectory": {"clearance_m": clearance, **motion},
-        "gains": gains, "residual_weights": dict(COST_WEIGHTS),
+        "actuators": actuators, "residual_weights": dict(COST_WEIGHTS),
     }
     with TerminalKeys() as keys:
-        start_auto_attachment(isaac_port, command_names, gains)
+        start_auto_attachment(isaac_port, command_names, actuators)
         bridge = IsaacBridge(robot.joints.actuated_names, isaac_port)
         try:
             viewer = RvizPoses(bridge.node, urdf_path, command_names) if rviz else None
