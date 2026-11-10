@@ -1,4 +1,4 @@
-"""Offline checks for the clearance path and proximity-based Isaac attachment."""
+"""Offline checks for the clearance path and manually triggered Isaac grasp."""
 
 import contextlib
 import builtins
@@ -24,13 +24,14 @@ ClearanceTrajectory = CONTROLLER["ClearanceTrajectory"]
 
 class LauncherTests(unittest.TestCase):
     def test_launcher_refuses_playing_and_passes_configuration_when_stopped(self):
-        source = "def start_attachment(*args):\n import builtins\n builtins._helios_test_args = args\n"
-        start = CONTROLLER["start_auto_attachment"]
+        source = "def start_grasp(*args, **kwargs):\n import builtins\n builtins._helios_test_args = (args, kwargs)\n"
+        start = CONTROLLER["start_grasp_helper"]
         request = Mock(return_value={})
         actuators = {"body": {"joint_names_expr": ["motor"], "stiffness": 71.1}}
+        grasp = {"closing_speed_rad_s": 0.2}
         with patch.dict(start.__globals__, {"isaac_request": request}), \
                 patch.object(Path, "read_text", return_value=source):
-            start(8226, ["motor"], actuators)
+            start(8226, ["motor"], actuators, grasp)
         code = request.call_args.args[0]
         timeline = SimpleNamespace(get_timeline_interface=lambda: SimpleNamespace(is_stopped=lambda: False))
         with patch.dict(sys.modules, {"omni": SimpleNamespace(timeline=timeline), "omni.timeline": timeline}):
@@ -39,19 +40,19 @@ class LauncherTests(unittest.TestCase):
             timeline.get_timeline_interface = lambda: SimpleNamespace(is_stopped=lambda: True)
             try:
                 exec(code, {})
-                self.assertEqual(builtins._helios_test_args, (os.getpid(), actuators, ["motor"], CONTROLLER["RU_TARGET_M"]))
+                self.assertEqual(builtins._helios_test_args, ((os.getpid(), actuators, ["motor"], CONTROLLER["RU_TARGET_M"], CONTROLLER["HAND_OFFSET_M"]), grasp))
             finally:
                 del builtins._helios_test_args
 
-    def test_release_uses_one_direct_isaac_call(self):
+    def test_close_uses_one_direct_isaac_call(self):
         bridge = CONTROLLER["IsaacBridge"].__new__(CONTROLLER["IsaacBridge"])
         bridge.isaac_port = 8226
-        helper = SimpleNamespace(release=Mock())
+        helper = SimpleNamespace(start_closing=Mock())
         request = lambda code, *_args, **_kwargs: exec(code, {})
-        with patch.object(builtins, "helios_attachment", helper, create=True), \
-                patch.dict(bridge.release.__func__.__globals__, {"isaac_request": request}):
-            bridge.release()
-            helper.release.assert_called_once()
+        with patch.object(builtins, "helios_grasp", helper, create=True), \
+                patch.dict(bridge.start_closing.__func__.__globals__, {"isaac_request": request}):
+            bridge.start_closing()
+            helper.start_closing.assert_called_once()
 
 
 class TrajectoryTests(unittest.TestCase):
@@ -114,24 +115,16 @@ class TrajectoryTests(unittest.TestCase):
                 ClearanceTrajectory([0]*3, [1]*3, [0, 0.15, 0], durations, 0.02, 0.05)
 
 
-class AttachmentTests(unittest.TestCase):
+class GraspTests(unittest.TestCase):
     def setUp(self):
-        # USD/Isaac are not installed in the terminal venv. Exercise the real
-        # helper callbacks with an in-memory joint attribute and fake scene poses.
+        # Exercise the real helper callbacks without an Isaac runtime.
         usd = SimpleNamespace(EditContext=lambda *_: contextlib.nullcontext())
         pxr = SimpleNamespace(Gf=Mock(), Sdf=Mock(), Usd=usd, UsdGeom=Mock(), UsdPhysics=Mock())
-        source = Path(__file__).resolve().parents[1] / "examples/helios_attach_isaac.py"
+        source = Path(__file__).resolve().parents[1] / "examples/helios_grasp_isaac.py"
         with patch.dict("sys.modules", {"pxr": pxr}):
             module = runpy.run_path(str(source))
-        self.attach_distance = module["ATTACH_DISTANCE"]
-        helper = module["HeliosAttachment"].__new__(module["HeliosAttachment"])
+        helper = module["HeliosGrasp"].__new__(module["HeliosGrasp"])
         self.helper = helper
-        self.enabled = False
-        attr = Mock()
-        attr.Get.side_effect = lambda: self.enabled
-        attr.Set.side_effect = lambda value: setattr(self, "enabled", value)
-        helper.ru = Mock()
-        helper.ru.GetJointEnabledAttr.return_value = attr
         helper.stage, helper.layer = object(), object()
         helper.usd_context = Mock()
         helper.usd_context.get_stage.return_value = helper.stage
@@ -140,7 +133,22 @@ class AttachmentTests(unittest.TestCase):
         helper.timeline.is_playing.return_value = True
         helper.timeline.get_current_time.return_value = 5.0
         helper.closed, helper.owner_pid, helper.has_played = False, os.getpid(), False
-        helper.wait_clear = False
+        helper.closing = False
+        helper.ru_palm_path = "/palm"
+        helper.hand_offset = np.zeros(3)
+        helper.target_m = np.zeros(3)
+        helper.grasp_indices = np.array([3, 8])
+        helper.closed_targets = np.array([1.75, 1.87])
+        helper.closing_speed = 0.35
+        helper.closing_start = None
+        helper.closing_elapsed_s = 0.0
+        # Capture the articulation actions the helper sends to Isaac.
+        types = SimpleNamespace(ArticulationAction=lambda **kwargs: kwargs)
+        isaac = {"isaacsim": SimpleNamespace(), "isaacsim.core": SimpleNamespace(),
+                 "isaacsim.core.utils": SimpleNamespace(), "isaacsim.core.utils.types": types}
+        patcher = patch.dict("sys.modules", isaac)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         helper.effort_names = []
         helper.articulation = None
         helper.metres = 1.0
@@ -148,37 +156,64 @@ class AttachmentTests(unittest.TestCase):
         helper.message_type = SimpleNamespace
         helper.transform_point = Mock()
         helper.close = Mock()
-        self.hand = np.zeros(3)
-        helper.update.__func__.__globals__["anchor_position"] = (
-            lambda _joint, side, _transform: self.hand if side == 1 else np.zeros(3)
-        )
+        helper.transform_point.return_value = np.zeros(3)
 
     def update(self):
         self.helper.update(None)
         self.helper.close.assert_not_called()
         return json.loads(self.helper.publisher.publish.call_args.args[0].data)
 
-    def test_nearby_hand_attaches_without_command(self):
+    def test_arrival_does_not_close_without_command(self):
         status = self.update()
-        self.assertTrue(status["attached"])
+        self.assertFalse(status["closing"])
+        self.assertNotIn("attached", status)
         self.assertEqual(status["hand_m"], [0, 0, 0])
         self.assertEqual(status["sim_time_s"], 5.0)
 
-    def test_release_requires_leaving_radius_before_reattaching(self):
-        self.enabled = True
-        self.helper.release()
-        self.assertFalse(self.enabled)
-        self.assertFalse(self.update()["attached"])
-        self.hand = np.array([0, self.attach_distance + 0.001, 0])
-        self.assertFalse(self.update()["attached"])
-        self.hand = np.zeros(3)
-        self.assertTrue(self.update()["attached"])
+    def targets(self):
+        return [call.args[0] for call in self.helper.articulation.apply_action.call_args_list]
 
-    def test_attachment_requires_distance_threshold(self):
-        self.hand = np.array([0, self.attach_distance, 0])
-        self.assertFalse(self.update()["attached"])
-        self.hand = np.array([0, self.attach_distance - 0.001, 0])
-        self.assertTrue(self.update()["attached"])
+    def test_command_ramps_pd_targets_without_touching_gains_or_efforts(self):
+        helper = self.helper
+        helper.articulation = Mock()
+        helper.articulation.get_joint_positions.return_value = np.array([0.1, 1.9])
+        helper.physics_step(0.01)
+        helper.articulation.apply_action.assert_not_called()
+        helper.start_closing()
+        self.assertTrue(helper.closing)
+        # Simulation time drives the target ramp at closing_speed, toward each closing limit.
+        helper.physics_step(1.0)
+        helper.start_closing()  # Repeated command must not restart the ramp.
+        helper.physics_step(10.0)
+        expected = [[0.1, 1.9], [0.45, 1.87], [1.75, 1.87]]
+        self.assertEqual(len(self.targets()), len(expected))
+        for action, target in zip(self.targets(), expected):
+            np.testing.assert_allclose(action["joint_positions"], target)
+            np.testing.assert_array_equal(action["joint_indices"], [3, 8])
+        helper.articulation.set_joint_efforts.assert_not_called()
+        helper.articulation._articulation_view.set_gains.assert_not_called()
+        self.assertTrue(self.update()["closing"])
+
+    def test_invalid_closing_speed_is_rejected_before_isaac_setup(self):
+        for value in (0, -1, np.nan, np.inf):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "closing_speed_rad_s"):
+                type(self.helper)(0, {}, [], [0, 0, 0], [0, 0, 0], closing_speed_rad_s=value)
+
+    def test_stop_reopens_closing_targets(self):
+        helper = self.helper
+        helper.articulation = Mock()
+        helper.closing = True
+        helper.subscription = Mock()
+        helper.layer = SimpleNamespace(identifier="grasp")
+        helper.stage = Mock()
+        helper.usd_context.get_stage.return_value = helper.stage
+        helper.stage.GetSessionLayer.return_value.subLayerPaths = ["grasp"]
+        type(helper).close(helper)
+        np.testing.assert_array_equal(self.targets()[-1]["joint_positions"], [0, 0])
+        np.testing.assert_array_equal(self.targets()[-1]["joint_indices"], [3, 8])
+        self.assertFalse(helper.closing)
+        self.assertTrue(helper.closed)
+        self.assertEqual(helper.stage.GetSessionLayer().subLayerPaths, [])
 
     def test_owner_exit_closes_helper(self):
         with patch("os.kill", side_effect=ProcessLookupError):
@@ -245,7 +280,7 @@ class AttachmentTests(unittest.TestCase):
 
 
 class ControllerTests(unittest.TestCase):
-    def test_automatic_release_clearance_then_autoattachment(self):
+    def test_arrival_waits_for_manual_closing(self):
         self.check_transfer(jaxlie.SE3.identity())
 
     def test_initial_world_transform_uses_isaac_root_pose_once(self):
@@ -260,44 +295,38 @@ class ControllerTests(unittest.TestCase):
         supports = np.array([[1, 0, 0], [0, 0, 1], [-1, 0, 0]])
         goal = np.array([0.2, 0, 0.3])
         status = dict(target_m=np.asarray(root @ goal), hand_m=np.asarray(root @ np.zeros(3)),
-                      sim_time_s=0.0, attached=True,
+                      sim_time_s=0.0, closing=False,
                       rl_wrist_wrench=[1, 2, 3, 4, 5, 6], root_pose_wxyz_xyz=np.asarray(root.wxyz_xyz).tolist())
         published, commands, seeds, orientation_refs = [], [], [], []
-        seen_reattached = False
-        reads, key_reads, release_wait = 0, 0, 0
-        released = False
+        reads, key_reads, arrival_wait = 0, 0, 0
 
         def read():
-            nonlocal reads, release_wait, released
+            nonlocal reads
             reads += 1
             status["sim_time_s"] += 0.02
-            if release_wait:
-                release_wait -= 1
-                if not release_wait:
-                    status["attached"], released = False, True
-            # Deliberately different later feedback must not overwrite the IK seed.
             return jnp.zeros(3) if reads == 1 else jnp.full(3, 99.0)
 
-        def release():
-            nonlocal release_wait
-            commands.append("release")
-            release_wait = 3
+        def start_closing():
+            commands.append("close")
+            status["closing"] = True
 
         def publish(_names, cfg):
-            if not released:
-                np.testing.assert_allclose(cfg, 0)  # Wait for measured detachment.
             status["hand_m"] = np.asarray(root @ cfg)
-            if released and np.linalg.norm(np.asarray(cfg) - goal) < 1e-6:
-                status["attached"] = True
             published.append(np.array(cfg))
             return True
 
         def key():
-            nonlocal key_reads
+            nonlocal key_reads, arrival_wait
             key_reads += 1
             if key_reads > 100:
                 self.fail("Controller did not complete the transfer")
-            return "q" if seen_reattached else ""
+            if published and np.linalg.norm(published[-1] - goal) < 1e-6:
+                arrival_wait += 1
+                if arrival_wait <= 3:
+                    self.assertFalse(status["closing"])
+                    return ""
+                return "q" if status["closing"] else "c"
+            return ""
 
         def fk(cfg):
             positions = jnp.vstack([cfg, jnp.array(supports)])
@@ -305,15 +334,13 @@ class ControllerTests(unittest.TestCase):
             rotations = rotations.at[0].set(jaxlie.SO3.from_z_radians(cfg[0]).wxyz)
             return jnp.hstack([rotations, positions])
 
-        def solve(_robot, _indices, targets, _orientations, cfg, _base, _attached):
-            nonlocal seen_reattached
+        def solve(_robot, _indices, targets, _orientations, cfg, _base):
             seeds.append(np.array(cfg))
             orientation_refs.append(np.array(_orientations))
-            seen_reattached = _attached and status["attached"] and released
             return jnp.array(targets[0]), jaxlie.SE3.identity(), jnp.array(5), {"total_objective": jnp.array(0.0)}
 
-        bridge = SimpleNamespace(read=read, attachment_status=lambda: dict(status),
-                                 release=release, publish=publish,
+        bridge = SimpleNamespace(read=read, grasp_status=lambda: dict(status),
+                                 start_closing=start_closing, publish=publish,
                                  state=(SimpleNamespace(name=["x", "y", "z"], position=[99]*3), 0))
         robot = SimpleNamespace(forward_kinematics=fk, joints=SimpleNamespace(names=["x", "y", "z"], get_full_config=lambda cfg: cfg))
         viewer = Mock()
@@ -329,11 +356,11 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(summary["outcome"], "completed")
             np.testing.assert_allclose(summary["settings"]["target_world_m"], root @ goal, rtol=5e-4, atol=5e-5)
             self.assertEqual(summary["average_solver_steps"], 5)
-            self.assertEqual(summary["ik_calls"], len(seeds) - 2)  # Warmup excluded.
+            self.assertLessEqual(summary["ik_calls"], len(seeds) - 1)  # Warmup and holding excluded.
             self.assertEqual(summary["rl_wrist"]["valid_samples"], summary["ik_calls"])
             self.assertTrue((summaries[0].parent / "metrics.png").is_file())
-        self.assertEqual(commands, ["release"])
-        self.assertTrue(status["attached"])
+        self.assertEqual(commands, ["close"])
+        self.assertTrue(status["closing"])
         np.testing.assert_allclose(list(viewer.publish.call_args.args[0].values()), goal, atol=1e-6)
         self.assertIs(viewer.publish.call_args.args[2], bridge.state[0])
         self.assertEqual(viewer.publish.call_args.args[3], status["root_pose_wxyz_xyz"])

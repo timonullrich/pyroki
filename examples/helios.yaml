@@ -56,6 +56,7 @@ actuators:
       ".*_thumb_pip": 0.0005
       ".*_thumb_dip": 0.0005
       ".*_wrist": 0.0005
+    # RU manual grasp (c) caps its PD closing torque at these limits (drive maxForce).
     joint_effort_limit:
       ".*_(index|m1|m2|pinky)_abd": 0.66
       ".*_(index|m1|m2|pinky)_mcp": 0.78
@@ -65,6 +66,8 @@ actuators:
       ".*_thumb_pip": 1.95
       ".*_thumb_dip": 1.95
       ".*_wrist": 1.95
+grasp:
+  closing_speed_rad_s: 0.35  # RU closing targets and joint speed limit; about 20 degrees/second.
 trajectory:
   clearance_m: 0.15
   durations_s: [2.0, 3.0, 2.0]  # Retreat +Y, transfer, approach -Y.

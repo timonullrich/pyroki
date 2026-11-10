@@ -1,7 +1,8 @@
-"""Isaac-side attachment control and measured telemetry, installed by the launcher.
+"""Isaac-side manual RU grasp control and measured telemetry, installed by the launcher.
 
-All overrides live in an anonymous session layer removed on Stop/process exit.
-No edits are written to the saved robot or scene.
+USD overrides live in an anonymous session layer removed on Stop/process exit.
+Closing ramps PD position targets; the drives' maxForce caps the grasp torque.
+Targets reopen on exit. No edits are written to the saved scene.
 """
 
 import builtins
@@ -10,9 +11,15 @@ import os
 import re
 
 import numpy as np
-from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
+from pxr import Sdf, Usd, UsdGeom, UsdPhysics
 
-ATTACH_DISTANCE = 0.02
+# Positive flexion closes the RU fingers in the supplied Helios model.
+# Thumb basal/opposition joints also close; finger abduction and wrist keep their targets.
+RU_CLOSE_DIRECTIONS = {
+    **{f"right_{finger}_{joint}": 1.0
+       for finger in ("pinky", "m1", "m2", "index") for joint in ("mcp", "pip")},
+    **{f"right_thumb_{joint}": 1.0 for joint in ("mcp", "abd", "pip", "dip")},
+}
 ACTUATOR_PARAMS = ("stiffness", "damping", "friction", "armature", "joint_effort_limit", "joint_velocity_limit")
 
 
@@ -76,18 +83,51 @@ def apply_actuator(prim, params):
             prim.CreateAttribute(f"physxJoint:{physx[param]}", Sdf.ValueTypeNames.Float).Set(value)
 
 
-def anchor_position(joint, side, transform_point):
-    """Resolve localPos against its body, or world when that relationship is empty."""
-    body = getattr(joint, f"GetBody{side}Rel")().GetTargets()
-    local = np.array(getattr(joint, f"GetLocalPos{side}Attr")().Get(), dtype=float)
-    return transform_point(str(body[0]), local) if body else local
+def remove_ru_attachment(stage):
+    """Mask legacy RU D6 joints in the caller's session layer; none is required."""
+    for prim in list(stage.Traverse()):
+        if prim.GetTypeName() == "PhysicsJoint" and (
+            prim.GetName() == "D6Joint_RU" or any(
+                "or2r_R_Carpals" in str(path)
+                for path in UsdPhysics.Joint(prim).GetBody1Rel().GetTargets()
+            )
+        ):
+            prim.SetActive(False)
 
 
-class HeliosAttachment:
-    def __init__(self, owner_pid, actuators, effort_names, target_m=None):
+def check_grasp_drives(actuator_values):
+    """Closing uses the configured implicit PD drives, capped by joint_effort_limit."""
+    for name in RU_CLOSE_DIRECTIONS:
+        params = actuator_values.get(name, {})
+        for param in ("stiffness", "damping", "joint_effort_limit"):
+            value = params.get(param)
+            if value is None or not np.isfinite(value) or value <= 0:
+                raise ValueError(f"{name}: grasp requires a positive finite {param}")
+
+
+def closed_targets(driven):
+    """Closing-side joint limit of each RU closing joint, in radians."""
+    targets = []
+    for name, direction in RU_CLOSE_DIRECTIONS.items():
+        joint = UsdPhysics.RevoluteJoint(driven[name])
+        limit = (joint.GetUpperLimitAttr() if direction > 0 else joint.GetLowerLimitAttr()).Get()
+        if limit is None or not np.isfinite(limit):
+            raise ValueError(f"{name}: grasp requires a finite closing-side joint limit")
+        targets.append(np.radians(limit))
+    return np.asarray(targets)
+
+
+class HeliosGrasp:
+    def __init__(self, owner_pid, actuators, effort_names, target_m, hand_offset_m, closing_speed_rad_s=0.35):
+        if not np.isfinite(closing_speed_rad_s) or closing_speed_rad_s <= 0:
+            raise ValueError("closing_speed_rad_s must be positive and finite")
+        self.closing_speed = float(closing_speed_rad_s)
+        self.closing_elapsed_s = 0.0
+        self.closing_start = None
         import carb
         import omni.kit.app
         import omni.timeline
+        import omni.physx
         import omni.usd
         import rclpy
         from isaacsim.core.experimental.prims import XformPrim
@@ -100,14 +140,15 @@ class HeliosAttachment:
         self.owner_pid = owner_pid
         self.closed = False
         self.has_played = False
-        joints = (UsdPhysics.Joint(p) for p in self.stage.Traverse() if p.GetTypeName() == "PhysicsJoint")
-        self.ru, = [j for j in joints if any("or2r_R_Carpals" in str(p) for p in j.GetBody1Rel().GetTargets())]
+        wrist, = [UsdPhysics.Joint(p) for p in self.stage.Traverse()
+                  if p.GetName() == "right_wrist" and p.IsA(UsdPhysics.RevoluteJoint)]
+        self.ru_palm_path = str(wrist.GetBody1Rel().GetTargets()[0])
+        self.ru_forearm_path = str(wrist.GetBody0Rel().GetTargets()[0])
         self.effort_names = effort_names
         self.articulation = None
-        paths = {str(p) for rel in (self.ru.GetBody0Rel(), self.ru.GetBody1Rel()) for p in rel.GetTargets()}
-        self.ru_forearm_path = str(self.ru.GetBody1Rel().GetTargets()[0].GetParentPath())
-        paths.add(self.ru_forearm_path)
-        self.prims = {p: XformPrim(p, reset_xform_op_properties=False) for p in paths}
+        self.closing = False
+        self.prims = {p: XformPrim(p, reset_xform_op_properties=False)
+                      for p in (self.ru_palm_path, self.ru_forearm_path)}
         self.use_backend = use_backend
         settings = carb.settings.get_settings()
         self.backend = "fabric" if settings.get_as_bool("/app/useFabricSceneDelegate") else "usd"
@@ -122,33 +163,84 @@ class HeliosAttachment:
         unconfigured = sorted(set(driven) - set(actuator_values))
         if unconfigured:
             print(f"Keeping scene drive settings for {len(unconfigured)} joints: {', '.join(unconfigured)}")
-        if target_m is not None:
-            target_m = np.asarray(target_m, dtype=float)
-            if target_m.shape != (3,) or not np.isfinite(target_m).all():
-                raise ValueError("target_m must contain three finite body0-local coordinates in metres")
+        check_grasp_drives(actuator_values)
+        self.closed_targets = closed_targets(driven)
+        self.target_m = np.asarray(target_m, dtype=float)
+        self.hand_offset = np.asarray(hand_offset_m, dtype=float) / self.metres
+        for label, value in (("target_m", self.target_m), ("hand_offset_m", self.hand_offset)):
+            if value.shape != (3,) or not np.isfinite(value).all():
+                raise ValueError(f"{label} must contain three finite coordinates")
         if not rclpy.ok():
             rclpy.init(args=[])
-        self.node = rclpy.create_node("helios_ru_attachment")
+        self.node = rclpy.create_node("helios_ru_grasp")
         self.message_type = String
-        self.publisher = self.node.create_publisher(String, "/helios/ru_attachment", 1)
-        self.wait_clear = False
-        self.layer = Sdf.Layer.CreateAnonymous("helios_auto_attach")
+        self.publisher = self.node.create_publisher(String, "/helios/ru_status", 1)
+        self.layer = Sdf.Layer.CreateAnonymous("helios_grasp")
         self.stage.GetSessionLayer().subLayerPaths.insert(0, self.layer.identifier)
-        # A switchable external attachment must not become part of the articulation tree.
         with Usd.EditContext(self.stage, self.layer):
-            self.ru.CreateExcludeFromArticulationAttr(True)
-            if target_m is not None:
-                self.ru.CreateLocalPos0Attr(Gf.Vec3f(*(target_m / self.metres)))
+            remove_ru_attachment(self.stage)
             for name, params in actuator_values.items():
                 apply_actuator(driven[name], params)
+            # Limit the light fingers' physical speed throughout closing and contact.
+            for name in RU_CLOSE_DIRECTIONS:
+                apply_actuator(driven[name], {"joint_velocity_limit": closing_speed_rad_s})
+            # Start the RU fingers open, including any old scene drive targets.
+            for name, prim in driven.items():
+                if name.startswith("right_") and name != "right_wrist":
+                    drive = UsdPhysics.DriveAPI.Get(prim, "angular")
+                    drive.CreateTargetPositionAttr(0.0)
+                    drive.CreateTargetVelocityAttr(0.0)
         self.subscription = omni.kit.app.get_app().get_update_event_stream().create_subscription_to_pop(self.update)
+        self.physics_subscription = omni.physx.get_physx_interface().subscribe_physics_step_events(self.physics_step)
         print(f"Actuator settings applied to {len(actuator_values)} joints")
-        print(f"RU auto-attachment ready: distance < {ATTACH_DISTANCE} m")
+        print("RU grasp ready; fingers remain open until the terminal closing command")
 
-    def release(self):
-        with Usd.EditContext(self.stage, self.layer):
-            self.ru.GetJointEnabledAttr().Set(False)
-        self.wait_clear = True  # Leave the radius before allowing reattachment.
+    def start_closing(self):
+        if self.closed or not self.timeline.is_playing():
+            raise RuntimeError("Press Play before starting the RU grasp")
+        if self.closing:
+            return
+        self.initialize_articulation()
+        positions = self.articulation.get_joint_positions(joint_indices=self.grasp_indices)
+        self.closing_start = np.asarray(positions, dtype=float).reshape(-1)
+        if self.closing_start.shape != self.closed_targets.shape or not np.isfinite(self.closing_start).all():
+            raise RuntimeError("Could not read RU closing joint positions")
+        self.closing = True
+        self.closing_elapsed_s = 0.0
+        self.physics_step(0.0)
+        print(f"RU closing at {self.closing_speed:g} rad/s with the configured PD drives; "
+              "torque is capped at each joint_effort_limit")
+
+    def set_grasp_targets(self, targets):
+        from isaacsim.core.utils.types import ArticulationAction
+        self.articulation.apply_action(ArticulationAction(joint_positions=targets, joint_indices=self.grasp_indices))
+
+    def physics_step(self, dt):
+        if self.closed or not self.closing:
+            return
+        try:
+            # Targets move toward the closed limits; in contact the implicit drive
+            # pushes with stiffness * lag (damped), saturating at maxForce.
+            self.closing_elapsed_s += max(float(dt), 0.0)
+            travel = min(self.closing_speed * self.closing_elapsed_s, 2 * np.pi)
+            step = np.clip(self.closed_targets - self.closing_start, -travel, travel)
+            self.set_grasp_targets(self.closing_start + step)
+        except Exception as error:
+            print(f"RU grasp stopped: {error}")
+            self.close()
+
+    def initialize_articulation(self):
+        if self.articulation is not None:
+            return
+        from isaacsim.core.prims import SingleArticulation
+        body = Sdf.Path(self.ru_palm_path)
+        root = next(p.GetPath() for p in self.stage.Traverse()
+                    if p.HasAPI(UsdPhysics.ArticulationRootAPI) and body.HasPrefix(p.GetPath()))
+        articulation = SingleArticulation(str(root), reset_xform_properties=False)
+        articulation.initialize()
+        self.effort_indices = np.array([articulation.get_dof_index(name) for name in self.effort_names], dtype=int)
+        self.grasp_indices = np.array([articulation.get_dof_index(name) for name in RU_CLOSE_DIRECTIONS], dtype=int)
+        self.articulation = articulation
 
     def transform_point(self, path, local):
         # Fabric supplies the current simulated pose even when USD transforms are stale.
@@ -161,15 +253,7 @@ class HeliosAttachment:
     def read_efforts(self):
         """Initialize after Play; report missing measurements as missing, never zero."""
         try:
-            if self.articulation is None:
-                from isaacsim.core.prims import SingleArticulation
-                body = self.ru.GetBody1Rel().GetTargets()[0]
-                root = next(p.GetPath() for p in self.stage.Traverse()
-                            if p.HasAPI(UsdPhysics.ArticulationRootAPI) and body.HasPrefix(p.GetPath()))
-                articulation = SingleArticulation(str(root), reset_xform_properties=False)
-                articulation.initialize()
-                self.effort_indices = np.array([articulation.get_dof_index(name) for name in self.effort_names], dtype=int)
-                self.articulation = articulation
+            self.initialize_articulation()
             efforts = self.articulation.get_measured_joint_efforts(joint_indices=self.effort_indices)
             if efforts is None:
                 raise ValueError("Isaac returned no measured joint efforts")
@@ -229,21 +313,11 @@ class HeliosAttachment:
             return
         self.has_played = True
         try:
-            target = anchor_position(self.ru, 0, self.transform_point) * self.metres
-            hand = anchor_position(self.ru, 1, self.transform_point) * self.metres
-            distance = float(np.linalg.norm(hand - target))
-            if not np.isfinite(distance):
-                raise ValueError("Nonfinite attachment positions")
-            attached = bool(self.ru.GetJointEnabledAttr().Get())
-            if distance >= ATTACH_DISTANCE:
-                self.wait_clear = False
-            if not self.wait_clear and not attached and distance < ATTACH_DISTANCE:
-                with Usd.EditContext(self.stage, self.layer):
-                    self.ru.GetJointEnabledAttr().Set(True)
-                attached = True
-                print(f"RU attached at {distance * 100:.2f} cm")
+            hand = self.transform_point(self.ru_palm_path, self.hand_offset) * self.metres
+            if not np.isfinite(hand).all():
+                raise ValueError("Nonfinite hand position")
             self.publisher.publish(self.message_type(data=json.dumps({
-                "attached": attached, "target_m": target.tolist(),
+                "closing": self.closing, "target_m": self.target_m.tolist(),
                 "hand_m": hand.tolist(), "sim_time_s": self.timeline.get_current_time(),
                 "efforts_nm": self.read_efforts(),
                 "rl_wrist_wrench": self.read_wrist_wrench("or4r_right_wrist"),
@@ -253,24 +327,32 @@ class HeliosAttachment:
                 "ru_roll_rad": self.read_ru_roll(),
             })))
         except Exception as error:
-            print(f"RU auto-attach stopped: {error}")
+            print(f"RU grasp helper stopped: {error}")
             self.close()
 
     def close(self):
         if self.closed:
             return
         self.closed = True
+        self.physics_subscription = None  # Release the PhysX callback subscription.
+        if (self.closing and self.usd_context.get_stage() == self.stage
+                and not self.timeline.is_stopped()):
+            try:
+                self.set_grasp_targets(np.zeros_like(self.closed_targets))  # Reopen, as at startup.
+            except Exception as error:
+                print(f"Could not reopen the RU fingers: {error}")
+        self.closing = False
         self.subscription.unsubscribe()
         self.node.destroy_node()
         layers = self.stage.GetSessionLayer().subLayerPaths
         if self.layer.identifier in layers:
             layers.remove(self.layer.identifier)
-        print("RU auto-attach stopped; temporary joint overrides removed")
+        print("RU grasp stopped; temporary joint overrides removed")
 
 
-def start_attachment(owner_pid, actuators, effort_names, target_m=None):
-    previous = getattr(builtins, "helios_attachment", None)
+def start_grasp(owner_pid, actuators, effort_names, target_m, hand_offset_m, **grasp):
+    previous = getattr(builtins, "helios_grasp", None)
     if previous is not None:
         previous.close()
-    builtins.helios_attachment = HeliosAttachment(owner_pid, actuators, effort_names, target_m)
-    return builtins.helios_attachment
+    builtins.helios_grasp = HeliosGrasp(owner_pid, actuators, effort_names, target_m, hand_offset_m, **grasp)
+    return builtins.helios_grasp

@@ -98,12 +98,12 @@ class RolloutMetrics:
             "definitions": {
                 "computation": "Synchronized IK call including returned diagnostics; excludes JIT warmup, logging and plots.",
                 "steps": "jaxls SolveSummary.iterations per IK call, including rejected solves.",
-                "tracking": "Measured RU attachment-point position versus the previously published target at feedback sampling time.",
+                "tracking": "Measured RU palm reference-point position versus the previously published target at feedback sampling time.",
                 "ru_roll": "Wrist-parent +Z forearm tilt: atan2(world Z, abs(world Y)); horizontal = 0. CSV: rad, plot: degrees.",
                 "efforts": "Isaac get_measured_joint_efforts(), N m; missing samples are NaN, not zero.",
                 "rl_wrist": "get_measured_joint_forces() at or4r_right_wrist, child joint frame: Fx/Fy/Fz (N), Tx/Ty/Tz (N m). Missing: NaN.",
                 "costs": "Sum of squared weighted soft residuals before/after solve, evaluated in the IK model. Hard violations are separate; internal AL penalties excluded.",
-                "sampling": "One row per active control-loop solve (release through attachment); latest Isaac sample may repeat.",
+                "sampling": "One row per active control-loop solve (retreat through arrival); latest Isaac sample may repeat.",
             },
         }
         for name in ("initial_objective", "total_objective"):

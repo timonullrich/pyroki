@@ -38,19 +38,18 @@ def apply_pose(stage, pose):
     attachments = {}
     cache = UsdGeom.XformCache()
     metres = UsdGeom.GetStageMetersPerUnit(stage)
-    for arm in ("RU", "LU", "RL", "LL"):
+    for arm in ("LU", "RL", "LL"):
         matches = [p for p in prims if p.GetName() == f"D6Joint_{arm}" and p.IsA(UsdPhysics.Joint)]
         if len(matches) != 1:
             raise ValueError(f"Expected one D6 attachment for {arm}")
         joint = attachments[arm] = UsdPhysics.Joint(matches[0])
-        if arm != "RU":
-            point = Gf.Vec3d(joint.GetLocalPos0Attr().Get())
-            bodies = joint.GetBody0Rel().GetTargets()
-            if bodies:
-                point = cache.GetLocalToWorldTransform(stage.GetPrimAtPath(bodies[0])).Transform(point)
-            expected = Gf.Vec3d(*pose["attachments"][arm]["target_world_m"])
-            if (point * metres - expected).GetLength() > 1e-5:
-                raise ValueError(f"{arm} anchor changed; rerun helios_initial_pose.py")
+        point = Gf.Vec3d(joint.GetLocalPos0Attr().Get())
+        bodies = joint.GetBody0Rel().GetTargets()
+        if bodies:
+            point = cache.GetLocalToWorldTransform(stage.GetPrimAtPath(bodies[0])).Transform(point)
+        expected = Gf.Vec3d(*pose["attachments"][arm]["target_world_m"])
+        if (point * metres - expected).GetLength() > 1e-5:
+            raise ValueError(f"{arm} anchor changed; rerun helios_initial_pose.py")
 
     desired = Gf.Matrix4d().SetRotate(Gf.Quatd(orientation[0], Gf.Vec3d(*orientation[1:])))
     desired.SetTranslateOnly(Gf.Vec3d(*(v / metres for v in position)))
@@ -79,9 +78,13 @@ def apply_pose(stage, pose):
                     rigid = UsdPhysics.RigidBodyAPI(prim)
                     rigid.CreateVelocityAttr(Gf.Vec3f(0.0))
                     rigid.CreateAngularVelocityAttr(Gf.Vec3f(0.0))
-            for arm, joint in attachments.items():
+            for joint in attachments.values():
                 joint.CreateExcludeFromArticulationAttr(True)
-                joint.CreateJointEnabledAttr(arm != "RU")
+                joint.CreateJointEnabledAttr(True)
+            # Legacy scenes may still contain an RU D6. It is never used.
+            for prim in prims:
+                if prim.GetName() == "D6Joint_RU" and prim.IsA(UsdPhysics.Joint):
+                    prim.SetActive(False)
     except Exception:
         session.subLayerPaths.remove(layer.identifier)
         raise
@@ -97,7 +100,7 @@ def apply_in_isaac(pose):
 
     if not omni.timeline.get_timeline_interface().is_stopped():
         raise RuntimeError("Stop Isaac before applying the initial pose")
-    helper = getattr(builtins, "helios_attachment", None)
+    helper = getattr(builtins, "helios_grasp", None)
     if helper is not None and not helper.closed:
         raise RuntimeError("Exit the retargeting controller before applying the initial pose")
     apply_pose(omni.usd.get_context().get_stage(), pose)
