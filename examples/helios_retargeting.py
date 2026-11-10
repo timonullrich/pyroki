@@ -32,7 +32,7 @@ from helios_rviz import RvizPoses
 
 DEFAULT_URDF = (
     Path(__file__).resolve().parents[2]
-    / "Thesis/third_party/ORBIT_urdf_stack/helios_description/urdf/helios_quadmanual_flat.urdf"
+    / "Thesis/third_party/ORBIT_urdf_stack/helios_description/urdf/helios_quadmanual_flat_inertias.urdf"
 )
 HANDS = {
     "RU": ("right_wrist", "or2r_R_Carpals_8d1f1041"),

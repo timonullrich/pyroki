@@ -101,7 +101,9 @@ python examples/helios_apply_initial_pose.py
 ```
 
 The script applies the base pose, non-finger initial joint states, matching drive
-targets, and zero velocities. LU/RL/LL are enabled and any legacy RU D6 is masked. Start the
+targets, and zero velocities. It also opens the LU/RL/LL thumbs (`SUPPORT_THUMB_DEG`:
+abduction −15°, MCP −25°) as both initial state and drive target: at 0° they start
+4–8 mm inside the bars, which makes the contacts fight every step. LU/RL/LL are enabled and any legacy RU D6 is masked. Start the
 retargeting controller afterward, then press Play. Joint states take effect when
 physics initializes, using Isaac's [JointStateAPI](https://docs.omniverse.nvidia.com/kit/docs/omni_physics/107.3/dev_guide/rigid_bodies_articulations/articulations.html#jointstateapi-for-set-and-get-of-joint-position-and-velocity).
 The setup remains in a temporary session layer across Stop/Play; rerunning the
@@ -109,7 +111,7 @@ script replaces it, and reloading the scene discards it. No USD files are saved.
 Use `--pose-path` for another pose JSON or `--isaac-port` for another server port.
 
 For this scene, the reported world base pose also applies to
-`/World/helios_quadmanual_flat`, whose parent has an identity transform.
+`/World/helios_quadmanual_flat_inertias` (the old `/World/helios_quadmanual_flat` is deactivated), whose parent has an identity transform.
 The solution removes attachment-position mismatch; it is not a static force-balance solve.
 
 The Pyroki library and its original license are retained; see `LICENSE`.

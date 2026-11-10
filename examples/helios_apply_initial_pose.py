@@ -10,6 +10,19 @@ import math
 from pathlib import Path
 import socket
 
+# At 0 deg the LU/RL/LL thumbs start 4-8 mm inside their bars (palm anchors are
+# 20 mm from the bar axis, radius 15 mm). These angles clear every bar by
+# >= 6.7 mm in the solved pose and stay clear of the -18 deg abduction limit.
+SUPPORT_THUMB_DEG = {"abd": -15.0, "mcp": -25.0}
+SUPPORT_THUMB_PREFIXES = {"LU": "left_thumb_", "RL": "or4r_right_thumb_", "LL": "or4l_left_thumb_"}
+
+
+def support_thumb_positions():
+    """Opened LU/RL/LL thumb joints in radians; other finger joints stay unchanged."""
+    return {prefix + joint: math.radians(degrees)
+            for prefix in SUPPORT_THUMB_PREFIXES.values()
+            for joint, degrees in SUPPORT_THUMB_DEG.items()}
+
 
 def apply_pose(stage, pose):
     """Author the initial state in one replaceable session layer."""
@@ -22,7 +35,10 @@ def apply_pose(stage, pose):
         raise ValueError(f"Missing base frame: {pose['base_prim']}")
     position = pose["base_position_world_m"]
     orientation = pose["base_orientation_world_wxyz"]
-    joints = pose["joint_positions_rad"]
+    thumbs = support_thumb_positions()
+    if thumbs.keys() & pose["joint_positions_rad"].keys():
+        raise ValueError("The pose already sets support thumb joints; remove them or SUPPORT_THUMB_DEG")
+    joints = {**pose["joint_positions_rad"], **thumbs}
     if (len(position) != 3 or len(orientation) != 4 or not joints
             or not all(math.isfinite(v) for v in [*position, *orientation, *joints.values()])
             or not math.isclose(sum(v * v for v in orientation), 1.0, abs_tol=1e-6)):
@@ -104,7 +120,9 @@ def apply_in_isaac(pose):
     if helper is not None and not helper.closed:
         raise RuntimeError("Exit the retargeting controller before applying the initial pose")
     apply_pose(omni.usd.get_context().get_stage(), pose)
-    print(f"Initial pose applied for {len(pose['joint_positions_rad'])} joints; fingers unchanged.")
+    thumbs = ", ".join(f"{joint} {degrees:g} deg" for joint, degrees in SUPPORT_THUMB_DEG.items())
+    print(f"Initial pose applied for {len(pose['joint_positions_rad'])} joints.")
+    print(f"LU/RL/LL thumbs opened clear of the bars ({thumbs}); other fingers unchanged.")
     print("LU/RL/LL attached; RU detached. Joint states take effect on Play.")
     print("Session overrides only; reload the scene to discard them.")
 

@@ -1,7 +1,7 @@
 {
   "scene": "/home/timon/repos/Thesis/assests/scene_helios_v0.usd",
   "base_frame": "world",
-  "base_prim": "/World/helios_quadmanual_flat/Geometry/world",
+  "base_prim": "/World/helios_quadmanual_flat_inertias/Geometry/world",
   "base_position_world_m": [
     0.7306707503973618,
     0.644176580593763,
