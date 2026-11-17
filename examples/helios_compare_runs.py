@@ -35,6 +35,7 @@ class Approach:
 
     @property
     def label(self):
+        """Name with run counts, for console output only; charts show the plain name."""
         interrupted = sum(outcome != "completed" for _, outcome, _ in self.runs)
         extra = f", {interrupted} not completed" if interrupted else ""
         return f"{self.name} ({len(self.runs)} run{'s' * (len(self.runs) != 1)}{extra})"
@@ -176,7 +177,7 @@ def plot_tracking(plt, approaches, path):
         rmse = mean_std(approach.per_run(lambda c: np.sqrt(np.nanmean((c["tracking_error_m"] * 1000) ** 2))))[0]
         ax.fill_between(time, low, high, color=approach.color, alpha=0.1, linewidth=0)
         ax.plot(time, mean, color=approach.color, linewidth=2, solid_capstyle="round",
-                label=f"{approach.label}, RMSE {rmse:.1f} mm")
+                label=f"{approach.name}, RMSE {rmse:.1f} mm")
         last = np.flatnonzero(np.isfinite(mean))[-1]
         ax.plot(time[last], mean[last], "o", color=approach.color, markersize=8,
                 markeredgecolor=SURFACE, markeredgewidth=2)
@@ -207,7 +208,7 @@ def grouped_bars(plt, approaches, categories, metrics, title, unit, path, horizo
         offset = positions - 0.4 + width * (k + 0.5)
         mean, std = stats[:, k, 0], stats[:, k, 1]
         bar = ax.barh if horizontal else ax.bar
-        bar(offset, mean, width, color=approach.color, edgecolor=SURFACE, linewidth=1.5, label=approach.label)
+        bar(offset, mean, width, color=approach.color, edgecolor=SURFACE, linewidth=1.5, label=approach.name)
         error_kw = dict(fmt="none", ecolor=TEXT_SECONDARY, elinewidth=1, capsize=3)
         if horizontal:
             ax.errorbar(mean, offset, xerr=std, **error_kw)
@@ -248,8 +249,7 @@ def single_bars(plt, approaches, metric, title, unit, fmt, path):
         ax.scatter(x + jitter, values, s=36, color=TEXT_SECONDARY, edgecolors=SURFACE, linewidths=1.5, zorder=3)
     # Values sit in the tick labels so they never collide with run dots.
     means = [mean_std(a.per_run(metric))[0] for a in approaches]
-    ax.set_xticks(positions, [f"{a.name}: {fmt.format(m)}\n{a.label.removeprefix(a.name).strip()}"
-                              for a, m in zip(approaches, means)])
+    ax.set_xticks(positions, [f"{a.name}: {fmt.format(m)}" for a, m in zip(approaches, means)])
     ax.set_ylabel(unit)
     ax.set_ylim(bottom=0)
     ax.margins(y=0.12)
