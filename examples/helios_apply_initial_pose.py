@@ -1,7 +1,7 @@
 """Apply helios_initial_pose.json to stopped Isaac through its Python server.
 
-Initial states and drive targets are temporary USD session overrides. Press Play
-afterward to initialize physics at this pose; no scene files are saved.
+Link poses, initial states and drive targets are temporary USD session overrides:
+the pose is visible right away, and Play initializes physics at it; no scene files are saved.
 """
 
 import argparse
@@ -24,8 +24,30 @@ def support_thumb_positions():
             for joint, degrees in SUPPORT_THUMB_DEG.items()}
 
 
-def apply_pose(stage, pose):
-    """Author the initial state in one replaceable session layer."""
+def pose_child_link(joint_prim, degrees):
+    """Move the joint's child link so the stage shows the angle before Play."""
+    from pxr import Gf, UsdGeom, UsdPhysics
+
+    joint = UsdPhysics.RevoluteJoint(joint_prim)
+    body0, = joint.GetBody0Rel().GetTargets()
+    body1, = joint.GetBody1Rel().GetTargets()
+    child = joint_prim.GetStage().GetPrimAtPath(body1)
+    if child.GetParent().GetPath() != body0:
+        raise ValueError(f"{joint_prim.GetName()}: child link is not nested under its parent link")
+    frames = []
+    for pos, rot in ((joint.GetLocalPos0Attr().Get(), joint.GetLocalRot0Attr().Get()),
+                     (joint.GetLocalPos1Attr().Get(), joint.GetLocalRot1Attr().Get())):
+        frames.append(Gf.Matrix4d().SetRotate(Gf.Quatd(rot)).SetTranslateOnly(Gf.Vec3d(pos)))
+    axis = Gf.Vec3d(*(float(a == joint.GetAxisAttr().Get()) for a in "XYZ"))
+    local = frames[1].GetInverse() * Gf.Matrix4d().SetRotate(Gf.Rotation(axis, degrees)) * frames[0]
+    ops = {op.GetOpName(): op for op in UsdGeom.Xformable(child).GetOrderedXformOps()}
+    translate, orient = ops["xformOp:translate"], ops["xformOp:orient"]
+    translate.Set(type(translate.Get())(local.ExtractTranslation()))
+    orient.Set(type(orient.Get())(local.ExtractRotationQuat().GetNormalized()))
+
+
+def apply_pose(stage, pose, target=None):
+    """Author the initial state in one replaceable session layer, or in target if given."""
     from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics
 
     if Path(stage.GetRootLayer().realPath).resolve() != Path(pose["scene"]).resolve():
@@ -75,8 +97,11 @@ def apply_pose(stage, pose):
     session = stage.GetSessionLayer()
     previous = [p for p in session.subLayerPaths
                 if Sdf.Layer.Find(p) and Sdf.Layer.Find(p).GetDisplayName() == "helios_initial_pose"]
-    layer = Sdf.Layer.CreateAnonymous("helios_initial_pose")
-    session.subLayerPaths.insert(0, layer.identifier)
+    layer = target or Sdf.Layer.CreateAnonymous("helios_initial_pose")
+    if target:
+        previous = []
+    else:
+        session.subLayerPaths.insert(0, layer.identifier)
     try:
         with Usd.EditContext(stage, layer):
             xform.MakeMatrixXform().Set(local)
@@ -85,6 +110,7 @@ def apply_pose(stage, pose):
                 state = PhysxSchema.JointStateAPI.Apply(prim, "angular")
                 state.CreatePositionAttr(degrees)
                 state.CreateVelocityAttr(0.0)
+                pose_child_link(prim, degrees)
                 drive = UsdPhysics.DriveAPI.Get(prim, "angular")
                 if drive:
                     drive.CreateTargetPositionAttr(degrees)
@@ -102,14 +128,30 @@ def apply_pose(stage, pose):
                 if prim.GetName() == "D6Joint_RU" and prim.IsA(UsdPhysics.Joint):
                     prim.SetActive(False)
     except Exception:
-        session.subLayerPaths.remove(layer.identifier)
+        if not target:
+            session.subLayerPaths.remove(layer.identifier)
         raise
     for identifier in previous:
         session.subLayerPaths.remove(identifier)
     return layer
 
 
-def apply_in_isaac(pose):
+def save_copy(pose):
+    """Write the scene with this pose baked in next to the original, which stays untouched."""
+    from pxr import Sdf, Usd
+
+    scene = Path(pose["scene"])
+    path = scene.with_name(f"{scene.stem}_initial_pose{scene.suffix}")
+    # Same folder, so relative asset paths still resolve.
+    if not Sdf.Layer.FindOrOpen(str(scene)).Export(str(path)):
+        raise RuntimeError(f"Could not write {path}")
+    stage = Usd.Stage.Open(str(path))
+    apply_pose(stage, {**pose, "scene": str(path)}, target=stage.GetRootLayer())
+    stage.GetRootLayer().Save()
+    return path
+
+
+def apply_in_isaac(pose, save=False):
     import builtins
     import omni.timeline
     import omni.usd
@@ -123,20 +165,24 @@ def apply_in_isaac(pose):
     thumbs = ", ".join(f"{joint} {degrees:g} deg" for joint, degrees in SUPPORT_THUMB_DEG.items())
     print(f"Initial pose applied for {len(pose['joint_positions_rad'])} joints.")
     print(f"LU/RL/LL thumbs opened clear of the bars ({thumbs}); other fingers unchanged.")
-    print("LU/RL/LL attached; RU detached. Joint states take effect on Play.")
+    print("LU/RL/LL attached; RU detached. Physics starts from this pose on Play.")
     print("Session overrides only; reload the scene to discard them.")
+    if save:
+        print(f"Saved a copy with this pose: {save_copy(pose)}")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pose-path", type=Path, default=Path("helios_initial_pose.json"))
     parser.add_argument("--isaac-port", type=int, default=8226)
+    parser.add_argument("--save", action="store_true",
+                        help="also write <scene>_initial_pose.usd with the pose baked in")
     args = parser.parse_args()
     pose = json.loads(args.pose_path.read_text())
     source = Path(__file__).read_text()
     code = ("_helios_pose = {'__name__': '_helios_pose'}\n"
             f"exec(compile({source!r}, 'helios_apply_initial_pose.py', 'exec'), _helios_pose)\n"
-            f"_helios_pose['apply_in_isaac']({pose!r})\n")
+            f"_helios_pose['apply_in_isaac']({pose!r}, save={args.save!r})\n")
     with socket.create_connection(("127.0.0.1", args.isaac_port), timeout=5.0) as connection:
         connection.settimeout(30.0)
         connection.sendall(code.encode())

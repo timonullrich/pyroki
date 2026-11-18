@@ -52,10 +52,16 @@ class ApplyPoseTests(unittest.TestCase):
         stage = Usd.Stage.CreateNew(str(Path(directory) / "scene.usda"))
         UsdGeom.SetStageMetersPerUnit(stage, 1.0)  # Like scene_helios_v0.usd.
         UsdGeom.Xform.Define(stage, "/World/robot/Geometry/world")
+        UsdGeom.Xform.Define(stage, "/World/robot/Geometry/world/base_link")
         names = [*pose["joint_positions_rad"], *APPLY["support_thumb_positions"]()]
         for name in names:
-            joint = UsdPhysics.RevoluteJoint.Define(stage, f"/World/robot/Physics/{name}").GetPrim()
-            UsdPhysics.DriveAPI.Apply(joint, "angular")
+            joint = UsdPhysics.RevoluteJoint.Define(stage, f"/World/robot/Physics/{name}")
+            UsdPhysics.DriveAPI.Apply(joint.GetPrim(), "angular")
+            child = UsdGeom.Xform.Define(stage, f"/World/robot/Geometry/world/base_link/{name}_child")
+            child.AddTranslateOp().Set(Gf.Vec3d(0.0))
+            child.AddOrientOp().Set(Gf.Quatf(1.0))
+            joint.CreateBody0Rel().SetTargets(["/World/robot/Geometry/world/base_link"])
+            joint.CreateBody1Rel().SetTargets([child.GetPath()])
         for arm in ("LU", "RL", "LL"):
             joint = UsdPhysics.Joint.Define(stage, f"/World/robot/Physics/D6Joint_{arm}")
             joint.CreateLocalPos0Attr(Gf.Vec3f(*pose["attachments"][arm]["target_world_m"]))
@@ -63,7 +69,7 @@ class ApplyPoseTests(unittest.TestCase):
         return stage
 
     def test_support_thumbs_get_opened_state_and_matching_drive_target(self):
-        from pxr import UsdPhysics
+        from pxr import Gf, UsdGeom, UsdPhysics
         with tempfile.TemporaryDirectory() as directory:
             pose = {**POSE, "base_prim": "/World/robot/Geometry/world"}
             stage = self.make_stage(directory, pose)
@@ -80,6 +86,10 @@ class ApplyPoseTests(unittest.TestCase):
             name, radians = next(iter(POSE["joint_positions_rad"].items()))
             prim = stage.GetPrimAtPath(f"/World/robot/Physics/{name}")
             self.assertAlmostEqual(prim.GetAttribute("state:angular:physics:position").Get(), math.degrees(radians), places=4)
+            # The child link is posed too, so the stage shows the angle before Play (X is the default axis).
+            child = UsdGeom.Xformable(stage.GetPrimAtPath(f"/World/robot/Geometry/world/base_link/{name}_child"))
+            expected = Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d(1, 0, 0), math.degrees(radians)))
+            self.assertTrue(Gf.IsClose(child.GetLocalTransformation(), expected, 1e-6))
 
     def test_pose_that_already_sets_a_support_thumb_is_rejected(self):
         pose = {**POSE, "joint_positions_rad": {**POSE["joint_positions_rad"], "left_thumb_abd": 0.0}}

@@ -1,4 +1,6 @@
-"""Solve a starting pose for the saved scene's LU/RL/LL attachment points.
+"""Solve a starting pose for the saved scene's LU/RL/LL attachment points and RU_TARGET_M.
+
+LU/RL/LL palms keep their scene orientation so the opened thumbs stay clear of the bars.
 
 Reads USD only; does not connect to or modify Isaac. Fingers are fixed at zero.
 """
@@ -23,6 +25,9 @@ from helios_retargeting import DEFAULT_URDF, HANDS, load_helios
 
 DEFAULT_SCENE = Path(__file__).resolve().parents[2] / "Thesis/assests/scene_helios_v0.usd"
 SUPPORTS = ("LU", "RL", "LL")
+# RU end-effector target in world metres, set by hand (not read from the scene).
+RU_TARGET_M = (0.3, 0.5, 1.208)
+ARMS = (*SUPPORTS, "RU")
 
 
 def read_attachments(scene_path, urdf_path):
@@ -66,15 +71,24 @@ def read_attachments(scene_path, urdf_path):
     return yourdfpy.URDF(urdf.robot, load_meshes=False), np.array(targets), root_matrix, str(root_path)
 
 
+def support_orientations(robot, indices, joints, base):
+    """World orientations of the LU/RL/LL palms."""
+    return base.rotation() @ jaxlie.SO3(robot.forward_kinematics(joints)[indices[:len(SUPPORTS)], :4])
+
+
 @jdc.jit
 def solve_initial_pose(robot, indices, targets, seed_base):
     joints, base = robot.joint_var_cls(0), jaxls.SE3Var(0)
     seed_joints = robot.joint_var_cls.default_factory()
+    # Keep the support palms as oriented in the scene, where the opened thumbs clear the bars.
+    seed_orientations = support_orientations(robot, indices, seed_joints, seed_base)
 
     @jaxls.Cost.factory(kind="constraint_eq_zero")
     def attachments(vals, joints, base):
         positions = vals[base] @ robot.forward_kinematics(vals[joints])[indices, 4:]
-        return ((positions - targets) * 1000.0).flatten()
+        orientations = support_orientations(robot, indices, vals[joints], vals[base])
+        return jnp.concatenate([((positions - targets) * 1000.0).flatten(),
+                                (seed_orientations.inverse() @ orientations).log().flatten()])
 
     @jaxls.Cost.factory
     def stay_near_seed(vals, joints, base):
@@ -97,8 +111,9 @@ def main(
     """Print and save base pose, non-finger joint positions, and attachment errors."""
     jax.config.update("jax_enable_x64", True)
     urdf, targets, seed_matrix, root_path = read_attachments(scene_path, urdf_path)
+    targets = np.vstack([targets, RU_TARGET_M])
     robot = pk.Robot.from_urdf(urdf, default_joint_cfg=urdf.zero_cfg)
-    indices = jnp.array([robot.links.names.index(f"ee_{arm}") for arm in SUPPORTS])
+    indices = jnp.array([robot.links.names.index(f"ee_{arm}") for arm in ARMS])
     seed_base = jaxlie.SE3.from_matrix(jnp.asarray(seed_matrix))
     initial_positions = np.asarray(seed_base @ robot.forward_kinematics(robot.joint_var_cls.default_factory())[indices, 4:])
     solution = solve_initial_pose(robot, indices, jnp.asarray(targets), seed_base)
@@ -109,12 +124,18 @@ def main(
     # Independently verify the solution with yourdfpy FK, including mimic joints.
     urdf.update_cfg(dict(zip(robot.joints.actuated_names, np.asarray(cfg))))
     base_matrix = np.asarray(base.as_matrix())
-    verified = np.array([(base_matrix @ urdf.get_transform(f"ee_{arm}"))[:3, 3] for arm in SUPPORTS])
+    verified = np.array([(base_matrix @ urdf.get_transform(f"ee_{arm}"))[:3, 3] for arm in ARMS])
     errors = np.linalg.norm(verified - targets, axis=1)
+    seed_rotations = Rotation.from_matrix(np.asarray(support_orientations(
+        robot, indices, robot.joint_var_cls.default_factory(), seed_base).as_matrix()))
+    turned = np.degrees((seed_rotations.inv() * Rotation.from_matrix(np.array(
+        [(base_matrix @ urdf.get_transform(f"ee_{arm}"))[:3, :3] for arm in SUPPORTS]))).magnitude())
     limits_ok = all(j.limit.lower - 1e-6 <= positions[j.name] <= j.limit.upper + 1e-6
                     for j in urdf.robot.joints if j.type == "revolute")
-    if not np.isfinite(base_matrix).all() or not np.isfinite(errors).all() or errors.max() > 1e-4 or not limits_ok:
-        raise RuntimeError(f"No validated pose: attachment errors {errors * 1000} mm, joint limits OK: {limits_ok}")
+    if (not np.isfinite(base_matrix).all() or not np.isfinite(errors).all() or errors.max() > 1e-4
+            or not np.isfinite(turned).all() or turned.max() > 0.01 or not limits_ok):
+        raise RuntimeError(f"No validated pose: attachment errors {errors * 1000} mm, "
+                           f"support palms turned {turned} deg, joint limits OK: {limits_ok}")
 
     report = {
         "scene": str(scene_path.resolve()),
@@ -128,7 +149,7 @@ def main(
         "attachments": {
             arm: {"target_world_m": targets[i].tolist(), "initial_error_mm": float(np.linalg.norm(initial_positions[i] - targets[i]) * 1000),
                   "solved_error_mm": float(errors[i] * 1000)}
-            for i, arm in enumerate(SUPPORTS)
+            for i, arm in enumerate(ARMS)
         },
     }
     output.write_text(json.dumps(report, indent=2) + "\n")
