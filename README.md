@@ -115,3 +115,8 @@ For this scene, the reported world base pose also applies to
 The solution removes attachment-position mismatch; it is not a static force-balance solve.
 
 The Pyroki library and its original license are retained; see `LICENSE`.
+
+
+cd ~/repos/IsaacLab
+uv run --extra isaacsim isaacsim
+source .venv/bin/activate

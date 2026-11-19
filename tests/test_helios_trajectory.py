@@ -181,7 +181,7 @@ class GraspTests(unittest.TestCase):
         helper.articulation.apply_action.assert_not_called()
         helper.start_closing()
         self.assertTrue(helper.closing)
-        # Simulation time drives the target ramp at closing_speed, toward each closing limit.
+        # Simulation time drives the target ramp at closing_speed, toward each grasp pose target.
         helper.physics_step(1.0)
         helper.start_closing()  # Repeated command must not restart the ramp.
         helper.physics_step(10.0)
@@ -197,7 +197,11 @@ class GraspTests(unittest.TestCase):
     def test_invalid_closing_speed_is_rejected_before_isaac_setup(self):
         for value in (0, -1, np.nan, np.inf):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "closing_speed_rad_s"):
-                type(self.helper)(0, {}, [], [0, 0, 0], [0, 0, 0], closing_speed_rad_s=value)
+                type(self.helper)(0, {}, [], [0, 0, 0], [0, 0, 0], {"right_index_mcp": 1.0}, closing_speed_rad_s=value)
+
+    def test_empty_grasp_pose_is_rejected_before_isaac_setup(self):
+        with self.assertRaisesRegex(ValueError, "grasp_pose"):
+            type(self.helper)(0, {}, [], [0, 0, 0], [0, 0, 0], {})
 
     def test_stop_reopens_closing_targets(self):
         helper = self.helper

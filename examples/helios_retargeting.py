@@ -317,7 +317,8 @@ def main(
 ):
     config = yaml.safe_load(config_path.read_text())
     motion, actuators = config["trajectory"], config["actuators"]
-    grasp = {"closing_speed_rad_s": 0.35, **config.get("grasp", {})}
+    grasp = {"closing_speed_rad_s": 0.35, **config.get("grasp", {}),
+             "grasp_pose": json.loads(Path(__file__).with_name("helios_ru_grasp_pose.json").read_text())}
     clearance = float(motion.pop("clearance_m"))
     if not np.isfinite(clearance) or clearance <= 0:
         raise ValueError("clearance_m must be positive and finite (Isaac world +Y)")

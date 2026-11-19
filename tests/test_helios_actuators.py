@@ -1,5 +1,6 @@
 """Offline checks that helios.yaml actuators resolve and author like Isaac Lab."""
 
+import json
 from pathlib import Path
 import runpy
 import unittest
@@ -10,6 +11,7 @@ import yaml
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
 SCENE = Path(__file__).resolve().parents[3] / "Thesis/assests/scene_helios_v0.usd"
 GRASP = runpy.run_path(str(EXAMPLES / "helios_grasp_isaac.py"))
+GRASP_POSE = json.loads((EXAMPLES / "helios_ru_grasp_pose.json").read_text())
 resolve = GRASP["resolve_actuators"]
 ACTUATORS = yaml.safe_load((EXAMPLES / "helios.yaml").read_text())["actuators"]
 FINGERS = [f"{f}_{j}" for f in ("pinky", "m1", "m2", "index") for j in ("abd", "mcp", "pip")]
@@ -22,35 +24,35 @@ JOINTS += [f"{prefix}{side}_{name}" for prefix, side in (("", "right"), ("", "le
 
 
 class ActuatorTests(unittest.TestCase):
-    def test_grasp_uses_only_ru_closing_joints_with_configured_pd_drives(self):
+    def test_grasp_uses_only_ru_finger_joints_with_configured_pd_drives(self):
         values = resolve(JOINTS, ACTUATORS)
-        names = list(GRASP["RU_CLOSE_DIRECTIONS"])
-        self.assertEqual(len(names), 12)
+        names = list(GRASP_POSE)
+        self.assertEqual(len(names), 16)
         self.assertTrue(all(name.startswith("right_") for name in names))
         self.assertNotIn("right_wrist", names)
-        self.assertNotIn("right_index_abd", names)
-        GRASP["check_grasp_drives"](values)  # helios.yaml configures every closing drive.
+        GRASP["check_grasp_drives"](values, names)  # helios.yaml configures every grasp drive.
         for param in ("stiffness", "damping", "joint_effort_limit"):
             for bad in (None, 0, -1, np.inf, np.nan):
                 broken = {name: dict(params) for name, params in values.items()}
                 broken[names[0]][param] = bad
                 with self.subTest(param=param, value=bad), self.assertRaisesRegex(ValueError, f"positive finite {param}"):
-                    GRASP["check_grasp_drives"](broken)
+                    GRASP["check_grasp_drives"](broken, names)
 
-    def test_closing_targets_are_closing_side_joint_limits_in_radians(self):
+    def test_closing_targets_are_the_grasp_pose_within_joint_limits(self):
         from pxr import Usd, UsdPhysics
         stage = Usd.Stage.CreateInMemory()
         driven = {}
-        for i, name in enumerate(GRASP["RU_CLOSE_DIRECTIONS"]):
+        for name in GRASP_POSE:
             joint = UsdPhysics.RevoluteJoint.Define(stage, f"/{name}")
-            joint.CreateLowerLimitAttr(-15.0)
-            joint.CreateUpperLimitAttr(30.0 + i)
+            joint.CreateLowerLimitAttr(-45.0)
+            joint.CreateUpperLimitAttr(33.0 if name == "right_thumb_mcp" else 100.0)  # Scene limits.
             driven[name] = joint.GetPrim()
-        targets = GRASP["closed_targets"](driven)
-        np.testing.assert_allclose(targets, np.radians(30.0 + np.arange(len(driven))))
-        UsdPhysics.RevoluteJoint(driven["right_index_pip"]).GetUpperLimitAttr().Set(float("inf"))
-        with self.assertRaisesRegex(ValueError, "right_index_pip.*finite closing-side"):
-            GRASP["closed_targets"](driven)
+        np.testing.assert_allclose(GRASP["closed_targets"](driven, GRASP_POSE), list(GRASP_POSE.values()))
+        for bad in (2.0, np.nan):
+            with self.subTest(value=bad), self.assertRaisesRegex(ValueError, "right_index_pip.*outside"):
+                GRASP["closed_targets"](driven, {**GRASP_POSE, "right_index_pip": bad})
+        with self.assertRaisesRegex(ValueError, "right_wrist.*not a revolute joint"):
+            GRASP["closed_targets"](driven, {**GRASP_POSE, "right_wrist": 0.0})
 
     def test_legacy_ru_joint_is_optional_and_masking_preserves_supports(self):
         from pxr import Sdf, Usd, UsdPhysics

@@ -1,7 +1,7 @@
 """Apply helios_initial_pose.json to stopped Isaac through its Python server.
 
-Link poses, initial states and drive targets are temporary USD session overrides:
-the pose is visible right away, and Play initializes physics at it; no scene files are saved.
+Initial states and drive targets are temporary USD session overrides. Press Play
+afterward to initialize physics at this pose; no scene files are saved.
 """
 
 import argparse
@@ -22,28 +22,6 @@ def support_thumb_positions():
     return {prefix + joint: math.radians(degrees)
             for prefix in SUPPORT_THUMB_PREFIXES.values()
             for joint, degrees in SUPPORT_THUMB_DEG.items()}
-
-
-def pose_child_link(joint_prim, degrees):
-    """Move the joint's child link so the stage shows the angle before Play."""
-    from pxr import Gf, UsdGeom, UsdPhysics
-
-    joint = UsdPhysics.RevoluteJoint(joint_prim)
-    body0, = joint.GetBody0Rel().GetTargets()
-    body1, = joint.GetBody1Rel().GetTargets()
-    child = joint_prim.GetStage().GetPrimAtPath(body1)
-    if child.GetParent().GetPath() != body0:
-        raise ValueError(f"{joint_prim.GetName()}: child link is not nested under its parent link")
-    frames = []
-    for pos, rot in ((joint.GetLocalPos0Attr().Get(), joint.GetLocalRot0Attr().Get()),
-                     (joint.GetLocalPos1Attr().Get(), joint.GetLocalRot1Attr().Get())):
-        frames.append(Gf.Matrix4d().SetRotate(Gf.Quatd(rot)).SetTranslateOnly(Gf.Vec3d(pos)))
-    axis = Gf.Vec3d(*(float(a == joint.GetAxisAttr().Get()) for a in "XYZ"))
-    local = frames[1].GetInverse() * Gf.Matrix4d().SetRotate(Gf.Rotation(axis, degrees)) * frames[0]
-    ops = {op.GetOpName(): op for op in UsdGeom.Xformable(child).GetOrderedXformOps()}
-    translate, orient = ops["xformOp:translate"], ops["xformOp:orient"]
-    translate.Set(type(translate.Get())(local.ExtractTranslation()))
-    orient.Set(type(orient.Get())(local.ExtractRotationQuat().GetNormalized()))
 
 
 def apply_pose(stage, pose, target=None):
@@ -110,7 +88,6 @@ def apply_pose(stage, pose, target=None):
                 state = PhysxSchema.JointStateAPI.Apply(prim, "angular")
                 state.CreatePositionAttr(degrees)
                 state.CreateVelocityAttr(0.0)
-                pose_child_link(prim, degrees)
                 drive = UsdPhysics.DriveAPI.Get(prim, "angular")
                 if drive:
                     drive.CreateTargetPositionAttr(degrees)
@@ -165,7 +142,7 @@ def apply_in_isaac(pose, save=False):
     thumbs = ", ".join(f"{joint} {degrees:g} deg" for joint, degrees in SUPPORT_THUMB_DEG.items())
     print(f"Initial pose applied for {len(pose['joint_positions_rad'])} joints.")
     print(f"LU/RL/LL thumbs opened clear of the bars ({thumbs}); other fingers unchanged.")
-    print("LU/RL/LL attached; RU detached. Physics starts from this pose on Play.")
+    print("LU/RL/LL attached; RU detached. Joint states take effect on Play.")
     print("Session overrides only; reload the scene to discard them.")
     if save:
         print(f"Saved a copy with this pose: {save_copy(pose)}")

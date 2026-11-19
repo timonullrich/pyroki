@@ -1,7 +1,8 @@
 """Isaac-side manual RU grasp control and measured telemetry, installed by the launcher.
 
 USD overrides live in an anonymous session layer removed on Stop/process exit.
-Closing ramps PD position targets; the drives' maxForce caps the grasp torque.
+Closing ramps PD position targets toward the grasp pose (helios_ru_grasp_pose.json,
+radians); the drives' maxForce caps the grasp torque.
 Targets reopen on exit. No edits are written to the saved scene.
 """
 
@@ -13,13 +14,6 @@ import re
 import numpy as np
 from pxr import Sdf, Usd, UsdGeom, UsdPhysics
 
-# Positive flexion closes the RU fingers in the supplied Helios model.
-# Thumb basal/opposition joints also close; finger abduction and wrist keep their targets.
-RU_CLOSE_DIRECTIONS = {
-    **{f"right_{finger}_{joint}": 1.0
-       for finger in ("pinky", "m1", "m2", "index") for joint in ("mcp", "pip")},
-    **{f"right_thumb_{joint}": 1.0 for joint in ("mcp", "abd", "pip", "dip")},
-}
 ACTUATOR_PARAMS = ("stiffness", "damping", "friction", "armature", "joint_effort_limit", "joint_velocity_limit")
 
 
@@ -95,9 +89,9 @@ def remove_ru_attachment(stage):
             prim.SetActive(False)
 
 
-def check_grasp_drives(actuator_values):
+def check_grasp_drives(actuator_values, names):
     """Closing uses the configured implicit PD drives, capped by joint_effort_limit."""
-    for name in RU_CLOSE_DIRECTIONS:
+    for name in names:
         params = actuator_values.get(name, {})
         for param in ("stiffness", "damping", "joint_effort_limit"):
             value = params.get(param)
@@ -105,22 +99,27 @@ def check_grasp_drives(actuator_values):
                 raise ValueError(f"{name}: grasp requires a positive finite {param}")
 
 
-def closed_targets(driven):
-    """Closing-side joint limit of each RU closing joint, in radians."""
-    targets = []
-    for name, direction in RU_CLOSE_DIRECTIONS.items():
+def closed_targets(driven, grasp_pose):
+    """Grasp pose targets in radians, checked against the scene's joint limits."""
+    for name, value in grasp_pose.items():
+        if name not in driven or not driven[name].IsA(UsdPhysics.RevoluteJoint):
+            raise ValueError(f"{name}: grasp pose joint is not a revolute joint in the stage")
         joint = UsdPhysics.RevoluteJoint(driven[name])
-        limit = (joint.GetUpperLimitAttr() if direction > 0 else joint.GetLowerLimitAttr()).Get()
-        if limit is None or not np.isfinite(limit):
-            raise ValueError(f"{name}: grasp requires a finite closing-side joint limit")
-        targets.append(np.radians(limit))
-    return np.asarray(targets)
+        lower, upper = joint.GetLowerLimitAttr().Get(), joint.GetUpperLimitAttr().Get()
+        # 0.01 deg tolerance for rounded radians at a limit.
+        if not np.isfinite(value) or not lower - 0.01 <= np.degrees(value) <= upper + 0.01:
+            raise ValueError(f"{name}: grasp pose {value} rad is outside [{lower}, {upper}] deg")
+    return np.asarray(list(grasp_pose.values()), dtype=float)
 
 
 class HeliosGrasp:
-    def __init__(self, owner_pid, actuators, effort_names, target_m, hand_offset_m, closing_speed_rad_s=0.35):
+    def __init__(self, owner_pid, actuators, effort_names, target_m, hand_offset_m, grasp_pose,
+                 closing_speed_rad_s=0.35):
         if not np.isfinite(closing_speed_rad_s) or closing_speed_rad_s <= 0:
             raise ValueError("closing_speed_rad_s must be positive and finite")
+        if not grasp_pose:
+            raise ValueError("grasp_pose must name at least one RU joint")
+        self.grasp_names = list(grasp_pose)
         self.closing_speed = float(closing_speed_rad_s)
         self.closing_elapsed_s = 0.0
         self.closing_start = None
@@ -163,8 +162,8 @@ class HeliosGrasp:
         unconfigured = sorted(set(driven) - set(actuator_values))
         if unconfigured:
             print(f"Keeping scene drive settings for {len(unconfigured)} joints: {', '.join(unconfigured)}")
-        check_grasp_drives(actuator_values)
-        self.closed_targets = closed_targets(driven)
+        check_grasp_drives(actuator_values, self.grasp_names)
+        self.closed_targets = closed_targets(driven, grasp_pose)
         self.target_m = np.asarray(target_m, dtype=float)
         self.hand_offset = np.asarray(hand_offset_m, dtype=float) / self.metres
         for label, value in (("target_m", self.target_m), ("hand_offset_m", self.hand_offset)):
@@ -182,7 +181,7 @@ class HeliosGrasp:
             for name, params in actuator_values.items():
                 apply_actuator(driven[name], params)
             # Limit the light fingers' physical speed throughout closing and contact.
-            for name in RU_CLOSE_DIRECTIONS:
+            for name in self.grasp_names:
                 apply_actuator(driven[name], {"joint_velocity_limit": closing_speed_rad_s})
             # Start the RU fingers open, including any old scene drive targets.
             for name, prim in driven.items():
@@ -219,7 +218,7 @@ class HeliosGrasp:
         if self.closed or not self.closing:
             return
         try:
-            # Targets move toward the closed limits; in contact the implicit drive
+            # Targets move toward the grasp pose; in contact the implicit drive
             # pushes with stiffness * lag (damped), saturating at maxForce.
             self.closing_elapsed_s += max(float(dt), 0.0)
             travel = min(self.closing_speed * self.closing_elapsed_s, 2 * np.pi)
@@ -239,7 +238,7 @@ class HeliosGrasp:
         articulation = SingleArticulation(str(root), reset_xform_properties=False)
         articulation.initialize()
         self.effort_indices = np.array([articulation.get_dof_index(name) for name in self.effort_names], dtype=int)
-        self.grasp_indices = np.array([articulation.get_dof_index(name) for name in RU_CLOSE_DIRECTIONS], dtype=int)
+        self.grasp_indices = np.array([articulation.get_dof_index(name) for name in self.grasp_names], dtype=int)
         self.articulation = articulation
 
     def transform_point(self, path, local):
