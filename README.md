@@ -69,6 +69,27 @@ floats use four significant figures. The summary includes the destination in wor
 readings are NaN. Costs before/after solving are the model's soft objective;
 hard-constraint violations are shown separately.
 
+To teleoperate with ORBIT_Teleop (Quest), without any scripted motion or grasp:
+
+```bash
+python examples/helios_teleop.py
+```
+
+Start it with Isaac stopped and the initial pose applied, press Play, then start
+ORBIT_Teleop with `--relative` (e.g. `./scripts/start_orchestrator.sh --helios --offboard-only --relative`).
+It reads `/helios/high_level/targets/{right,left}_wrist_pose`, the finger slots of
+`/helios/high_level/commands` (ORBIT_Teleop's `HELIOS_JOINT_ORDER`, loaded from
+`../ORBIT_Teleop/openteach/constants.py`, `--teleop-constants`; ring/middle are USD m1/m2)
+and the operator's active pair from its status socket (`tcp://127.0.0.1:8106`, `--status-endpoint`).
+The base is free: the inactive pair's hands hold the robot where they are (hard positions,
+soft orientations), so moving the active pair (upper: RU/LU, lower: RL/LL) can move the
+whole body. Each active palm follows the operator's wrist motion since its pair became
+active, so activation and pair switches do not jump. The first time a pair is driven, its
+D6 bar attachments are disabled and its fingers follow the operator; fingers of a pair not
+yet driven keep their targets. The `helios.yaml` actuators and the released attachments live
+in one temporary session layer, kept across Stop/Play and removed when the controller exits
+(**q** or Ctrl+C). IK runs at most 10 solver iterations per tick (about 40 ms on CPU).
+
 To compare IK approaches offline (no ROS or Isaac needed), run:
 
 ```bash
