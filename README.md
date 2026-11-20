@@ -20,9 +20,9 @@ simulation seconds, with closing speed capped at 0.35 rad/s (about 20°/s).
 Full torque then continues until you exit or stop Isaac. Press **q** or Ctrl+C to exit. Restart after resetting
 the scene.
 
-RU uses physical finger contact only. Its old D6 joint is masked in the temporary
-session layer if present; it can also be deleted from the scene. There is no
-proximity attachment or automatic closing. A closing command does not confirm
+RU uses physical finger contact only. No script changes RU's D6 attachment
+(`D6Joint_RU`): switch it with **Joint Enabled** in the GUI, and keep it off while
+RU should move. There is no proximity attachment or automatic closing. A closing command does not confirm
 that an object has been grasped. LU/RL/LL retain their existing attachments.
 
 Configuration:
@@ -124,7 +124,7 @@ python examples/helios_apply_initial_pose.py
 The script applies the base pose, non-finger initial joint states, matching drive
 targets, and zero velocities. It also opens the LU/RL/LL thumbs (`SUPPORT_THUMB_DEG`:
 abduction −15°, MCP −25°) as both initial state and drive target: at 0° they start
-4–8 mm inside the bars, which makes the contacts fight every step. LU/RL/LL are enabled and any legacy RU D6 is masked. Start the
+4–8 mm inside the bars, which makes the contacts fight every step. LU/RL/LL are enabled; RU's D6 keeps its GUI setting. Start the
 retargeting controller afterward, then press Play. Joint states take effect when
 physics initializes, using Isaac's [JointStateAPI](https://docs.omniverse.nvidia.com/kit/docs/omni_physics/107.3/dev_guide/rigid_bodies_articulations/articulations.html#jointstateapi-for-set-and-get-of-joint-position-and-velocity).
 The setup remains in a temporary session layer across Stop/Play; rerunning the
@@ -139,5 +139,6 @@ The Pyroki library and its original license are retained; see `LICENSE`.
 
 
 cd ~/repos/IsaacLab
+source /opt/ros/jazzy/setup.bash
 uv run --extra isaacsim isaacsim
 source .venv/bin/activate

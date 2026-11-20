@@ -54,22 +54,6 @@ class ActuatorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "right_wrist.*not a revolute joint"):
             GRASP["closed_targets"](driven, {**GRASP_POSE, "right_wrist": 0.0})
 
-    def test_legacy_ru_joint_is_optional_and_masking_preserves_supports(self):
-        from pxr import Sdf, Usd, UsdPhysics
-        stage = Usd.Stage.CreateInMemory()
-        joints = {arm: UsdPhysics.Joint.Define(stage, f"/D6Joint_{arm}").GetPrim()
-                  for arm in ("RU", "LU", "RL", "LL")}
-        layer = Sdf.Layer.CreateAnonymous()
-        stage.GetSessionLayer().subLayerPaths.insert(0, layer.identifier)
-        with Usd.EditContext(stage, layer):
-            GRASP["remove_ru_attachment"](stage)
-            # Repeating this with no active RU joint is supported.
-            GRASP["remove_ru_attachment"](stage)
-        self.assertFalse(joints["RU"].IsActive())
-        self.assertTrue(all(joints[arm].IsActive() for arm in ("LU", "RL", "LL")))
-        stage.GetSessionLayer().subLayerPaths.remove(layer.identifier)
-        self.assertTrue(joints["RU"].IsActive())
-
     def test_every_scene_joint_gets_a_complete_configuration(self):
         names = JOINTS
         if SCENE.exists():

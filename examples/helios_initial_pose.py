@@ -26,7 +26,7 @@ from helios_retargeting import DEFAULT_URDF, HANDS, load_helios
 DEFAULT_SCENE = Path(__file__).resolve().parents[2] / "Thesis/assests/scene_helios_v0.usd"
 SUPPORTS = ("LU", "RL", "LL")
 # RU end-effector target in world metres, set by hand (not read from the scene).
-RU_TARGET_M = (0.3, 0.5, 1.208)
+RU_TARGET_M = (0.5799999833106995, 0.26499998569488525, 1.2086482048034668)
 ARMS = (*SUPPORTS, "RU")
 
 

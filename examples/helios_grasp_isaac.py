@@ -77,18 +77,6 @@ def apply_actuator(prim, params):
             prim.CreateAttribute(f"physxJoint:{physx[param]}", Sdf.ValueTypeNames.Float).Set(value)
 
 
-def remove_ru_attachment(stage):
-    """Mask legacy RU D6 joints in the caller's session layer; none is required."""
-    for prim in list(stage.Traverse()):
-        if prim.GetTypeName() == "PhysicsJoint" and (
-            prim.GetName() == "D6Joint_RU" or any(
-                "or2r_R_Carpals" in str(path)
-                for path in UsdPhysics.Joint(prim).GetBody1Rel().GetTargets()
-            )
-        ):
-            prim.SetActive(False)
-
-
 def check_grasp_drives(actuator_values, names):
     """Closing uses the configured implicit PD drives, capped by joint_effort_limit."""
     for name in names:
@@ -177,7 +165,6 @@ class HeliosGrasp:
         self.layer = Sdf.Layer.CreateAnonymous("helios_grasp")
         self.stage.GetSessionLayer().subLayerPaths.insert(0, self.layer.identifier)
         with Usd.EditContext(self.stage, self.layer):
-            remove_ru_attachment(self.stage)
             for name, params in actuator_values.items():
                 apply_actuator(driven[name], params)
             # Limit the light fingers' physical speed throughout closing and contact.

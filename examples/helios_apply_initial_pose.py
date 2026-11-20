@@ -100,10 +100,6 @@ def apply_pose(stage, pose, target=None):
             for joint in attachments.values():
                 joint.CreateExcludeFromArticulationAttr(True)
                 joint.CreateJointEnabledAttr(True)
-            # Legacy scenes may still contain an RU D6. It is never used.
-            for prim in prims:
-                if prim.GetName() == "D6Joint_RU" and prim.IsA(UsdPhysics.Joint):
-                    prim.SetActive(False)
     except Exception:
         if not target:
             session.subLayerPaths.remove(layer.identifier)
